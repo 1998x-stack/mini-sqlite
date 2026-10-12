@@ -23,5 +23,7 @@ jobs:
         run: python examples/quickstart.py
       - name: Smoke transactions
         run: python examples/transactions.py
+      - name: Smoke indexes
+        run: python examples/indexes.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite

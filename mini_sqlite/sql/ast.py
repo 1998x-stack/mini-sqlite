@@ -19,6 +19,13 @@ class CreateTableStmt:
 
 
 @dataclass(frozen=True)
+class CreateIndexStmt:
+    name: str
+    table: str
+    column: str
+
+
+@dataclass(frozen=True)
 class InsertStmt:
     table: str
     values: tuple[Any, ...]
@@ -54,6 +61,7 @@ class RollbackStmt:
 
 Statement = (
     CreateTableStmt
+    | CreateIndexStmt
     | InsertStmt
     | SelectStmt
     | DeleteStmt

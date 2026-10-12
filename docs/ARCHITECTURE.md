@@ -1,51 +1,51 @@
 # Architecture
 
-## 1. One statement, all layers
+## 1. Current vertical slice
 
 ```text
 Database.execute(sql)
-        |
-        v
+        │
+        ▼
       Parser
-        |
-        v
+        │
+        ▼
        AST
-        |
-        v
-     Planner
-        |
-        v
+        │
+        ▼
+     Planner ───────────── chooses AccessPath
+        │
+        ▼
        Plan
-        |
-        v
+        │
+        ▼
     Compiler
-        |
-        v
+        │
+        ▼
    Instruction[]
-        |
-        v
+        │
+        ▼
  VirtualMachine
-        |
-        +--> Catalog --+
-        |              |
-        v              v
-     Cursor          Schema
-        |
-        v
-      BTree
-        |
-        v
-      Pager
-        |
-        v
-    database file
+    │          │
+    │          └──────────────┐
+    ▼                         ▼
+Table Cursor             Index Cursor
+    │                         │
+    ▼                         ▼
+integer-key B+Tree       byte-key B+Tree
+    │                         │
+    └───────────┬─────────────┘
+                ▼
+              Pager
+         ┌──────┴──────┐
+         ▼             ▼
+ rollback journal   database file
 ```
 
-The architecture is deliberately more layered than the absolute minimum. That is the point: it mirrors the important separations in a real database.
+Parser and Planner never read page bytes. Both B+Tree families use Pager; Pager remains the sole durability boundary.
 
 ## 2. Page 0
 
-Page 0 is not a B+Tree page. It stores fixed metadata:
+Page 0 stores fixed metadata:
 
 ```text
 8 bytes  magic = MSQLITE1
@@ -57,183 +57,127 @@ Page 0 is not a B+Tree page. It stores fixed metadata:
 rest     zero
 ```
 
-## 3. B+Tree node header
+## 3. Table B+Tree
 
-Each B+Tree node begins with 32 bytes:
+The original table/catalog B+Tree uses signed INTEGER keys. Node types:
 
 ```text
-u8   node_type       LEAF or INTERNAL
-u8   flags
-u16  cell_count
-u32  parent_page
-u32  right_sibling   leaf chain; 0 when none
-u32  first_child     internal nodes only
-u16  free_start
-u16  content_start
-12B  reserved
+1 LEAF
+2 INTERNAL
 ```
 
-Then comes a `u16` cell-pointer array. Cell data is packed from the end of the page backwards.
-
-## 4. Leaf cells
+Leaf cell:
 
 ```text
 i64 key
 u32 value_length
-N B value
+value bytes
 ```
 
-The B+Tree treats `value` as opaque bytes. Table rows are encoded by `RecordCodec`; the catalog stores JSON-encoded schema bytes. This separation is useful because the B+Tree should not know row semantics.
-
-## 5. Internal cells
-
-An internal node uses a left-most `first_child` plus cells:
+Internal cell:
 
 ```text
 i64 separator_key
 u32 right_child
 ```
 
-For:
+Table values are `RecordCodec` rows. Catalog values are JSON `TableSchema` records.
+
+## 4. Secondary-index B+Tree
+
+v0.3 adds a separate byte-key tree. Node types:
 
 ```text
-first_child = A
-(100, B)
-(200, C)
+3 INDEX_LEAF
+4 INDEX_INTERNAL
 ```
 
-routing is:
+Its keys are opaque ordered bytes. `SecondaryIndex` gives those bytes SQL meaning through `KeyCodec`.
+
+Physical key:
 
 ```text
-key < 100       -> A
-100 <= key <200 -> B
-key >= 200      -> C
+encoded(indexed_value) || encoded(rowid)
 ```
 
-## 6. Leaf split
+The rowid suffix makes duplicate values unique and naturally orders duplicates by rowid.
 
-When a leaf no longer fits:
+## 5. Catalog ownership
+
+A `TableSchema` persists:
 
 ```text
-before
-
-[1 2 3 4 5 6]
+table_id
+name
+root_page
+columns[]
+indexes[]:
+    name
+    column
+    root_page
+    unique
 ```
 
-becomes:
+Root movement occurs at three places:
 
-```text
-left          right
-[1 2 3]  ->  [4 5 6]
-                ^
-                separator 4 inserted into parent
-```
+- catalog B+Tree root split -> page 0 changes;
+- table B+Tree root split -> table `root_page` changes;
+- secondary-index root split -> that `IndexSchema.root_page` changes.
 
-Rows are split by approximate byte footprint, not merely row count, because records are variable length.
+Each tree exposes an `on_root_change` callback so its owner persists the new root.
 
-## 7. Internal split
+## 6. Planner
 
-For an internal node:
-
-```text
-children: c0, c1, c2, c3, c4
-keys:         k1, k2, k3, k4
-```
-
-one middle separator is promoted to the parent. Children on the right half have their `parent` field rewritten to the new internal page.
-
-## 8. Catalog root and table roots
-
-There are two levels of root movement:
-
-- catalog B+Tree root may split -> page 0 must be updated
-- table B+Tree root may split -> that table's catalog record must be updated
-
-This is why `BTree` accepts an `on_root_change` callback.
-
-## 9. Row encoding
-
-`RecordCodec` is self-describing:
-
-```text
-u16 column_count
-
-for each column:
-    u8  type_tag
-    u32 byte_length
-
-payload bytes...
-```
-
-Record tags:
-
-```text
-0 NULL
-1 INTEGER (signed i64)
-2 TEXT (UTF-8)
-```
-
-## 10. Planning
-
-The planner recognizes only two access paths:
-
-### Primary-key equality
-
-```sql
-SELECT * FROM users WHERE id = 7;
-```
+v0.3 access paths:
 
 ```text
 PRIMARY_KEY
-```
-
-### Everything else
-
-```sql
-SELECT * FROM users WHERE age = 20;
-```
-
-```text
+SECONDARY_INDEX
 TABLE_SCAN
 ```
 
-This tiny distinction is enough to demonstrate why a secondary index matters in v0.3.
+Priority for equality predicates is primary key first, then a matching secondary index, otherwise scan. It is rule-based by design.
 
-## 11. VM
+## 7. VM
 
-The VM is intentionally register-light. Its opcodes include:
+Important v0.3 opcodes:
 
 ```text
 CREATE_TABLE
+CREATE_INDEX
 OPEN_READ
 OPEN_WRITE
+OPEN_INDEX
 REWIND
 SEEK_PK
+SEEK_INDEX_EQ
+INDEX_TO_TABLE
 FILTER_EQ
 PROJECT
 RESULT_ROW
 NEXT
+INDEX_NEXT
 INSERT_ROW
 DELETE_CURRENT
 HALT
 ```
 
-The compiler emits control-flow addresses into instructions. `REWIND`, `SEEK_PK`, `FILTER_EQ`, and `NEXT` can alter the program counter.
+`INDEX_TO_TABLE` makes secondary-index back-to-table lookup explicit rather than hiding it in planner or storage code.
 
-## 12. Durability boundary — v0.2
+## 8. Transaction composition
 
-v0.2 inserts rollback-journal durability below the B+Tree:
+v0.2 already established the physical protocol:
 
 ```text
-BTree mutation
-    ↓
-Pager.write_page
-    ↓
-first write to old page? ── yes ──→ append before-image to journal
-    ↓
-commit: journal fsync → DB flush/fsync → journal delete
+first modification to old page
+        ↓
+append before-image to journal
+        ↓
+modify page
 ```
 
-New pages do not need before-images; the journal records the database page count at `BEGIN`, so rollback/recovery truncates transaction-created pages. A hot journal is recovered before page 0 metadata is decoded.
+v0.3 simply causes more pages to participate. Table and index mutations share the same Pager transaction and the same hot-journal recovery process.
 
-See `TRANSACTIONS.md` for the exact protocol and simplifications.
+## 9. Why there are two B+Tree implementations in v0.3
+
+The table tree keeps the v0.1 fixed `i64` key format. The new index tree introduces variable-length byte keys without rewriting historical table storage. This makes the architectural delta visible and preserves the older learning slice. A later version may unify these behind a generic tree abstraction once the two mechanisms are understood separately.

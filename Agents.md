@@ -1,205 +1,97 @@
-# Agents.md — mini-sqlite Development Contract
+# Agents.md — mini-sqlite v0.3 Development Contract
 
-> **Mandatory for every future iteration:** read this file before changing code, tests, documentation, branches, version scope, durability protocol, or architecture.
->
-> This is the canonical engineering contract for `main`. Version branches carry branch-specific `Agents.md` files.
+> **Frozen learning snapshot.** Read this file before changing v0.3 code, tests, documentation, index semantics, or planner behavior.
 
-## 1. Repository mission
+## 1. Version mission
 
-mini-sqlite is an educational, Python-first database engine for understanding mechanisms behind SQLite-style systems.
+v0.3 adds one dominant mental model to the v0.2 engine:
 
-Priorities:
+> **A secondary index is a second ordered structure that maps a search key to rowids, and every table mutation must keep both structures transactionally consistent.**
 
 ```text
-architectural clarity
-      ↓
-correctness + explicit invariants
-      ↓
-readable reference implementation
-      ↓
-mechanism-focused tests
-      ↓
-conceptual mapping to SQLite/database systems
-      ↓
-performance and SQL breadth later
+                         Catalog
+                      /           \
+                 table meta      index meta
+                      |              |
+SQL → Planner → AccessPath         Index B+Tree
+                 /      \              |
+          table scan   index seek ── rowid
+                                ↓
+                           table B+Tree
+                                ↓
+                              Pager
+                       rollback journal
 ```
-
-Do not optimize for SQLite API/file-format completeness or copy upstream SQLite source.
 
 ## 2. Mandatory reading order
 
-### On `main`
-
 1. `Agents.md`
-2. `Plan.md`
-3. `version.md`
-4. relevant architecture/format docs
-5. relevant tests
-6. current implementation
+2. `version.md`
+3. `docs/INDEXES.md`
+4. `docs/ARCHITECTURE.md`
+5. `docs/ON_DISK_FORMAT.md`
+6. `tests/test_indexes.py`
+7. `mini_sqlite/index/key_codec.py`
+8. `mini_sqlite/index/node.py`
+9. `mini_sqlite/index/btree.py`
+10. `mini_sqlite/index/secondary.py`
+11. `mini_sqlite/catalog/`
+12. `mini_sqlite/planner/`
+13. `mini_sqlite/vm/`
 
-### On a version branch
+## 3. Branch boundary
 
-1. branch `Agents.md`
-2. branch `version.md`
-3. relevant docs/tests/source
+This branch is the frozen **v0.3 secondary-index milestone**. Allowed changes are documentation fixes, tests clarifying v0.3 promises, and narrowly scoped defects inside the v0.3 boundary.
 
-Never assume a historical branch should contain later-version mechanisms.
+Do not backport v0.4 relational operators, JOIN, WAL, buffer replacement, cost-based optimization, or locking.
 
-## 3. Branch invariant
+## 4. Index invariants
 
-`main` must always be the newest integrated, validated state.
+- table rows remain keyed by the INTEGER PRIMARY KEY in the original table B+Tree;
+- a secondary index is a distinct page-backed B+Tree;
+- physical secondary keys are `(encoded indexed value, rowid)` so duplicate SQL values remain unique in the tree;
+- index lookup yields rowids, then VM explicitly returns to the table B+Tree;
+- index metadata is persisted in `TableSchema.indexes`;
+- index root page changes must be persisted in the catalog;
+- index creation indexes rows that already exist;
+- INSERT and DELETE must update table and every affected index in one v0.2 transaction;
+- rollback/crash recovery must restore both table and index pages atomically;
+- Planner performs no physical I/O.
 
-```text
-latest main
-   ↓
-create vX.Y
-   ↓
-implement one major database mental model
-   ↓
-full tests + docs + example
-   ↓
-freeze version branch
-   ↓
-integrate validated tree into main
-   ↓
-restore canonical main docs
-```
+## 5. Planner rule
 
-Forbidden: a version branch containing newer validated engine code while `main` remains stale.
-
-## 4. Version sequence
+For an equality predicate, access-path priority is:
 
 ```text
-v0.1  Page-backed B+Tree + SQL → Planner → VM
-v0.2  Rollback-journal transactions + crash recovery
-v0.3  Secondary indexes + richer planner                 ← next
-v0.4  Relational execution operators
-v0.5  JOIN
-v0.6  WAL
-v0.7  Bounded buffer manager
-v0.8  Cost-based optimizer
-v0.9  Concurrency / locking
-v1.0  Educationally complete mini SQLite
+PRIMARY_KEY
+    ↓
+SECONDARY_INDEX
+    ↓
+TABLE_SCAN
 ```
 
-One version should introduce one dominant mental model.
+v0.3 is rule based. Do not introduce a cost model on this branch.
 
-## 5. Current architecture
+## 6. Testing contract
 
-```text
-SQL → Parser → AST → Planner → Plan → Compiler → Bytecode → VM
-                                                       │
-                                                       ▼
-                                                     Cursor
-                                                       │
-                                  Catalog ─────────── B+Tree
-                                                       │
-                                                       ▼
-                                                     Pager
-                                               ┌───────┴───────┐
-                                               ▼               ▼
-                                      rollback journal    database file
-```
-
-v0.2 proves crash-atomic transactions can be added at the Pager boundary without contaminating B+Tree/VM/Planner logic.
-
-## 6. Architecture rules
-
-- separate policy from mechanism;
-- SQL frontend never accesses page bytes directly;
-- Planner never performs physical I/O;
-- VM talks to cursors/storage abstractions, not OS files;
-- B+Tree obtains and writes pages only through Pager;
-- Pager owns physical durability ordering;
-- connection transaction state belongs outside B+Tree;
-- schema/index metadata must be persisted, not reconstructed from Python state;
-- root page ids are mutable and owners must persist root changes;
-- future indexes must extend Catalog + Planner + B+Tree boundaries rather than special-case Parser/SELECT;
-- future WAL must replace/extend Pager durability behavior rather than rewrite query layers.
-
-## 7. On-disk protocol rule
-
-Any incompatible byte-layout change requires:
-
-- `FORMAT_VERSION` review/bump;
-- exact layout documentation;
-- corruption and bounds checks;
-- reopen tests;
-- compatibility/migration statement.
-
-A durability-order change is also a protocol change even when page bytes are unchanged.
-
-## 8. Testing contract
-
-Every new subsystem should include, where applicable:
-
-- happy path;
-- invariant/property tests;
-- error-path tests;
-- persistence/reopen validation;
-- fault/crash tests for durability work;
-- end-to-end integration test.
-
-Full regression:
+Run:
 
 ```bash
 python -m pytest -q
 python examples/quickstart.py
 python examples/transactions.py
+python examples/indexes.py
 python -m compileall -q mini_sqlite
 ```
 
-Never claim a version is validated unless the exact reported tree has passed the relevant suite.
+Index changes require tests for duplicate secondary values, TEXT key delimiting, index build over existing rows, root split/reopen, planner path choice, INSERT/DELETE maintenance, explicit rollback, hot-journal crash recovery, and low-level byte-key tree behavior.
 
-## 9. Documentation contract
+## 7. On-disk rule
 
-When architecture/public API changes, review:
+v0.3 adds additive page node types `3=INDEX_LEAF` and `4=INDEX_INTERNAL`; existing table page layouts remain unchanged. `TableSchema` JSON gains an optional `indexes` field. v0.3 can decode v0.1/v0.2 table metadata that lacks this field.
 
-```text
-version.md
-README.md
-Agents.md
-Plan.md
-relevant docs/*
-relevant example
-```
+Older writers must not modify a database after v0.3 indexes have been created because they do not maintain those indexes.
 
-Every version should state its theme, delta from previous release, important source files, recommended reading order, quick-run commands, explicit non-goals, and next-version rationale.
+## 8. Definition of Done
 
-## 10. Historical branch rule
-
-A frozen version branch may receive only documentation corrections, tests clarifying promised behavior, and narrowly scoped bug fixes within that version boundary. Do not backport future subsystems.
-
-## 11. Performance rule
-
-Prefer:
-
-```text
-readable reference
-   ↓
-correctness
-   ↓
-measure/profile
-   ↓
-optimized educational path
-```
-
-Do not obscure page/tree/transaction invariants for premature micro-optimization.
-
-## 12. Generated artifacts and dependencies
-
-Do not commit database files, journals, caches, logs, generated plots, or build artifacts unless a tiny deterministic fixture is explicitly required by tests. Keep the engine standard-library-first; development-only test/lint dependencies are acceptable.
-
-## 13. Definition of Done for a version
-
-A version can be frozen only when the primary mental model is explicit, promised implementation is complete, unit/invariant/error/crash tests pass where relevant, an educational example exists, `version.md` records the delta, branch-specific `Agents.md` exists, architecture/format docs are updated, package imports cleanly, the final branch tree is validated, and the integrated state is restored to `main`.
-
-## 14. Current main directive
-
-`main` contains the completed **v0.2 rollback-journal transaction milestone**.
-
-The next version should be **v0.3: Secondary Indexes + Richer Planner**.
-
-Central question:
-
-> How can a secondary index provide a different ordered access path while INSERT/DELETE and crash recovery keep table and index state atomically consistent?
+A v0.3-compatible change is complete only when the index remains visibly separate from the table, duplicate-key semantics remain `(value,rowid)`, planner choice is explainable, root changes survive reopen, table/index mutations remain crash-atomic through the existing Pager journal, and all v0.1/v0.2 regression behavior stays green.

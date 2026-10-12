@@ -1,49 +1,76 @@
-# Current integrated state — v0.2
+# mini-sqlite v0.3
 
-`main` currently contains the validated **v0.2 rollback-journal transaction** implementation on top of the v0.1 page/B+Tree/SQL/VM vertical slice.
+## Theme
 
-## Integrated architecture
+**Secondary indexes + richer planner access paths.**
+
+v0.3 keeps the v0.2 Pager transaction protocol intact and adds a second ordered access structure above it.
 
 ```text
-SQL → AST → Plan → Bytecode → VM → B+Tree → Pager
-                                            ├─ rollback journal
-                                            └─ database file
+WHERE age = 20
+     ↓
+   Planner
+     ↓
+SECONDARY_INDEX
+     ↓
+idx_users_age B+Tree
+     ↓
+   rowids
+     ↓
+users primary B+Tree
 ```
 
-## Current capabilities
+## Delta from v0.2
 
-- persistent 4 KiB page file;
-- slotted B+Tree leaf/internal pages and splits;
-- persistent catalog;
-- tokenizer/parser/AST/planner/tiny VM;
-- `CREATE`, `INSERT`, `SELECT`, `DELETE`;
-- primary-key seek vs table scan;
-- explicit and autocommit transactions;
-- before-image rollback journal;
-- hot-journal crash recovery;
-- rollback of new pages via truncation;
-- inspection commands for schema/pages/tree/plan/bytecode/transaction state.
+Added:
 
-## Reading order
+- `CREATE INDEX name ON table(column)`;
+- persistent `IndexSchema` metadata;
+- byte-key slotted B+Tree pages for secondary indexes;
+- `KeyCodec` for INTEGER/TEXT/NULL index prefixes;
+- physical `(indexed_value, rowid)` composite keys;
+- duplicate secondary-key support;
+- index build over pre-existing table rows;
+- index-root split persistence;
+- planner access path `SECONDARY_INDEX`;
+- VM index opcodes: `OPEN_INDEX`, `SEEK_INDEX_EQ`, `INDEX_TO_TABLE`, `INDEX_NEXT`;
+- transactional INSERT/DELETE index maintenance;
+- rollback/crash recovery covering table + index together;
+- `.indexes` and `.index INDEX` inspection;
+- `docs/INDEXES.md` and `examples/indexes.py`.
 
-For storage/query basics, read v0.1 layers first. For the newest mechanism, read:
+## Important source files
 
-1. `docs/TRANSACTIONS.md`
-2. `mini_sqlite/storage/journal.py`
-3. `mini_sqlite/storage/pager.py`
-4. `mini_sqlite/transaction/manager.py`
-5. `mini_sqlite/database.py`
-6. `tests/test_transactions.py`
+- `mini_sqlite/index/key_codec.py`
+- `mini_sqlite/index/node.py`
+- `mini_sqlite/index/btree.py`
+- `mini_sqlite/index/secondary.py`
+- `mini_sqlite/catalog/schema.py`
+- `mini_sqlite/catalog/catalog.py`
+- `mini_sqlite/planner/planner.py`
+- `mini_sqlite/vm/compiler.py`
+- `mini_sqlite/vm/vm.py`
+- `tests/test_indexes.py`
+- `docs/INDEXES.md`
 
-## Validation commands
+## Recommended reading order
 
-```bash
-python -m pytest -q
-python examples/quickstart.py
-python examples/transactions.py
-python -m compileall -q mini_sqlite
-```
+1. v0.1 table B+Tree
+2. v0.2 transaction/Pager journal
+3. `docs/INDEXES.md`
+4. `index/key_codec.py`
+5. `index/node.py`
+6. `index/btree.py`
+7. `index/secondary.py`
+8. `catalog/schema.py`
+9. `planner/planner.py`
+10. `vm/compiler.py` / `vm/vm.py`
+11. `tests/test_indexes.py`
+
+## Non-goals
+
+No UNIQUE indexes, multi-column indexes, range predicates, covering-index optimization, statistics/cost model, UPDATE, ORDER BY, aggregates, JOIN, WAL, or concurrent writers.
 
 ## Next
 
-See `Plan.md`: **v0.3 Secondary Indexes + Richer Planner**.
+v0.4 should add a **relational execution layer**: UPDATE, LIMIT, ORDER BY, aggregates, richer expressions, and clearer iterator/VM composition without changing the page/index/transaction foundations.

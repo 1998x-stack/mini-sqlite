@@ -8,6 +8,7 @@ from typing import Any, Iterator
 from mini_sqlite.btree import BTree
 from mini_sqlite.catalog import Catalog
 from mini_sqlite.constants import META_PAGE_ID
+from mini_sqlite.index import ByteKeyBTree
 from mini_sqlite.planner import Planner
 from mini_sqlite.planner.plan import SelectPlan
 from mini_sqlite.sql import Parser
@@ -125,7 +126,7 @@ class Database:
             if autocommit_write:
                 self.commit()
         except BaseException:
-            # v0.2 chooses a simple, safe policy: execution failure aborts the
+            # v0.2+ chooses a simple, safe policy: execution failure aborts the
             # whole active transaction rather than implementing statement savepoints.
             if self.in_transaction:
                 self.rollback()
@@ -163,27 +164,53 @@ class Database:
                 suffix = " PRIMARY KEY" if col.primary_key else ""
                 cols.append(f"{col.name} {col.type.value}{suffix}")
             chunks.append(f"CREATE TABLE {table.name} ({', '.join(cols)});")
+            for index in table.indexes:
+                chunks.append(
+                    f"CREATE INDEX {index.name} ON {table.name}({index.column});"
+                )
         return "\n".join(chunks)
+
+    def indexes_text(self) -> str:
+        rows = [
+            f"{index.name}: table={table.name} column={index.column} root={index.root_page}"
+            for table, index in self.catalog.list_indexes()
+        ]
+        return "\n".join(rows)
 
     def btree_dump(self, table_name: str) -> str:
         schema = self.catalog.get_table(table_name)
         tree = BTree(self.pager, schema.root_page)
         return tree.dump()
 
+    def index_dump(self, index_name: str) -> str:
+        _table, schema = self.catalog.get_index(index_name)
+        tree = ByteKeyBTree(self.pager, schema.root_page)
+        return tree.dump()
+
     def pages_text(self) -> str:
         from mini_sqlite.btree.node import BTreeNode
+        from mini_sqlite.index.node import IndexNode
 
-        lines = ["PAGE  TYPE       CELLS  PARENT  RIGHT"]
-        lines.append(f"{0:>4}  {'META':<10} {'-':>5}  {'-':>6}  {'-':>5}")
+        lines = ["PAGE  TYPE          CELLS  PARENT  RIGHT"]
+        lines.append(f"{0:>4}  {'META':<13} {'-':>5}  {'-':>6}  {'-':>5}")
         for page_id in range(1, self.pager.page_count):
+            raw = self.pager.get_page(page_id)
             try:
-                node = BTreeNode.decode(page_id, self.pager.get_page(page_id))
-                lines.append(
-                    f"{page_id:>4}  {node.node_type.name:<10} {node.cell_count:>5}  "
-                    f"{node.parent:>6}  {node.right_sibling:>5}"
-                )
+                node = BTreeNode.decode(page_id, raw)
+                kind = node.node_type.name
             except Exception:
-                lines.append(f"{page_id:>4}  {'UNKNOWN':<10} {'?':>5}  {'?':>6}  {'?':>5}")
+                try:
+                    node = IndexNode.decode(page_id, raw)
+                    kind = f"IDX_{node.node_type.name}"
+                except Exception:
+                    lines.append(
+                        f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}"
+                    )
+                    continue
+            lines.append(
+                f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  "
+                f"{node.parent:>6}  {node.right_sibling:>5}"
+            )
         return "\n".join(lines)
 
     def transaction_status(self) -> str:

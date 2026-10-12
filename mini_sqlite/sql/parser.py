@@ -5,6 +5,7 @@ from mini_sqlite.errors import ParseError
 from mini_sqlite.sql.ast import (
     BeginStmt,
     CommitStmt,
+    CreateIndexStmt,
     CreateTableStmt,
     DeleteStmt,
     EqualityPredicate,
@@ -25,7 +26,7 @@ class Parser:
     def parse(self) -> Statement:
         token_type = self.current.type
         if token_type == TokenType.CREATE:
-            stmt = self._create_table()
+            stmt = self._create()
         elif token_type == TokenType.INSERT:
             stmt = self._insert()
         elif token_type == TokenType.SELECT:
@@ -87,8 +88,25 @@ class Parser:
         self._match(TokenType.TRANSACTION)
         return BeginStmt()
 
-    def _create_table(self) -> CreateTableStmt:
+    def _create(self) -> Statement:
         self._expect(TokenType.CREATE)
+        if self.current.type == TokenType.TABLE:
+            return self._create_table_after_create()
+        if self.current.type == TokenType.INDEX:
+            return self._create_index_after_create()
+        raise self._error("expected TABLE or INDEX after CREATE")
+
+    def _create_index_after_create(self) -> CreateIndexStmt:
+        self._expect(TokenType.INDEX)
+        name = self._ident()
+        self._expect(TokenType.ON)
+        table = self._ident()
+        self._expect(TokenType.LPAREN)
+        column = self._ident()
+        self._expect(TokenType.RPAREN)
+        return CreateIndexStmt(name, table, column)
+
+    def _create_table_after_create(self) -> CreateTableStmt:
         self._expect(TokenType.TABLE)
         name = self._ident()
         self._expect(TokenType.LPAREN)

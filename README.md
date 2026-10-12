@@ -1,8 +1,10 @@
 # mini-sqlite
 
-A small SQLite-inspired database engine for learning how a SQL database works from SQL text down to bytes on disk.
+A small SQLite-inspired database engine for learning how a SQL database works from SQL text down to page bytes, indexes, and crash recovery.
 
-`mini-sqlite` is **not** a wrapper around Python `sqlite3`, and persisted rows are not stored in Python dictionaries. The current v0.2 pipeline is:
+`mini-sqlite` is **not** a wrapper around Python `sqlite3`. Persisted table/index state lives in page-backed B+Trees.
+
+## Current version: v0.3 — secondary indexes + richer planner
 
 ```text
 SQL text
@@ -12,57 +14,62 @@ Tokenizer / Parser
 AST
    ↓
 Rule-based Planner
+   ├─ PRIMARY_KEY
+   ├─ SECONDARY_INDEX
+   └─ TABLE_SCAN
    ↓
 Tiny bytecode Compiler
    ↓
 Virtual Machine
-   ↓
-B+Tree Cursor
-   ↓
-Persistent B+Tree
-   ↓
-Pager / 4 KiB pages
-   ├──────────────→ database file
-   └──────────────→ rollback journal (during writes)
+   ├─────────────┐
+   ▼             ▼
+Table Cursor   Index Cursor
+   │             │
+   ▼             ▼
+int-key B+Tree  byte-key B+Tree
+   └──────┬──────┘
+          ▼
+        Pager
+   ┌──────┴──────┐
+   ▼             ▼
+rollback journal database file
 ```
 
-## Current version: v0.2 — transactions + crash recovery
+v0.1 established pages/B+Tree/SQL/VM. v0.2 added rollback-journal transactions and hot-journal recovery. v0.3 answers:
 
-v0.1 established the page/B+Tree/SQL/VM vertical slice. v0.2 adds rollback-journal durability **under the B+Tree**, preserving the architecture while answering a new question:
+> Why can a secondary index turn a filter into logarithmic navigation, why does it still need a rowid lookup back into the table, and how do table + index stay transactionally consistent?
 
-> What prevents a database from being left half-written when a process crashes?
+## v0.3 capabilities
 
-### v0.1 foundation
+Foundation retained from v0.1/v0.2:
 
-- fixed 4096-byte database pages;
-- page cache + dirty-page flushing;
-- slotted B+Tree leaf/internal pages;
-- leaf, internal, and root splits;
+- 4096-byte pages and page cache;
+- slotted table/catalog B+Tree pages;
+- leaf/internal/root splits;
 - persistent catalog;
 - typed row codec (`NULL`, `INTEGER`, `TEXT`);
 - SQL tokenizer/parser/AST;
-- planner with primary-key seek vs table scan;
-- VDBE-inspired bytecode compiler/interpreter;
+- planner → bytecode compiler → VM;
 - `CREATE TABLE`, `INSERT`, `SELECT`, `DELETE`;
-- `.schema`, `.pages`, `.btree`, `.explain`, `.bytecode`.
+- explicit/autocommit transactions;
+- before-image rollback journal;
+- hot-journal crash recovery.
 
-### v0.2 additions
+New in v0.3:
 
-- `BEGIN [TRANSACTION]`;
-- `COMMIT` / `END [TRANSACTION]`;
-- `ROLLBACK [TRANSACTION]`;
-- write-statement autocommit;
-- connection transaction state machine;
-- physical before-image rollback journal;
-- first-write page journaling;
-- original database page-count tracking;
-- CRC32 validation for complete journal entries;
-- journal-fsync → DB-write/fsync → journal-delete commit ordering;
-- startup hot-journal recovery;
-- rollback of transaction-created B+Tree pages by truncation;
-- catalog/meta rollback;
-- Python `with db.transaction():` API;
-- `.txn` shell inspection.
+- `CREATE INDEX idx ON table(column)`;
+- persistent index metadata;
+- variable-length byte-key B+Tree pages;
+- `(indexed_value, rowid)` composite physical keys;
+- duplicate secondary-key support;
+- INTEGER/TEXT/NULL index key encoding;
+- build index over pre-existing rows;
+- planner choice among primary-key seek, secondary-index seek, and table scan;
+- explicit index-to-table rowid lookup in VM bytecode;
+- INSERT/DELETE maintenance of every index in the same transaction;
+- index root split persistence;
+- rollback/crash recovery covering table + indexes atomically;
+- `.indexes` / `.index INDEX` inspection.
 
 ## Install
 
@@ -78,115 +85,187 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 python examples/quickstart.py
 python examples/transactions.py
+python examples/indexes.py
 python -m compileall -q mini_sqlite
 ```
 
-## Quick session
-
-```text
-$ mini-sqlite demo.db
-mini-sqlite> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
-mini-sqlite> INSERT INTO users VALUES (1, 'Alice', 20);
-mini-sqlite> BEGIN;
-mini-sqlite> INSERT INTO users VALUES (2, 'Bob', 25);
-mini-sqlite> .txn
-mini-sqlite> ROLLBACK;
-mini-sqlite> SELECT * FROM users;
-1 | Alice | 20
-```
-
-## Transaction mental model
-
-When an existing page is modified for the first time in a transaction:
-
-```text
-old page image
-      ↓
-append to demo.db-journal
-      ↓
-modify cached database page
-```
-
-Commit ordering:
-
-```text
-1. fsync rollback journal
-2. write dirty database pages
-3. fsync database file
-4. delete rollback journal   ← commit point
-```
-
-If the process dies before journal deletion, startup sees the hot journal, restores old page images, truncates pages created by the transaction, fsyncs the repaired database, then removes the journal.
-
-## Why this is architecture-first
-
-The B+Tree API remains logical:
-
-```python
-search(key)
-insert(key, value)
-delete(key)
-scan()
-```
-
-It does not know whether durability is implemented with a rollback journal today or WAL in a later version. Pager owns durability protocol. This separation is the point of v0.2.
-
-## Planner example
+## Quick index session
 
 ```sql
-SELECT * FROM users WHERE id = 2;
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    age INTEGER
+);
+
+INSERT INTO users VALUES (1, 'Alice', 20);
+INSERT INTO users VALUES (2, 'Bob', 25);
+INSERT INTO users VALUES (3, 'Carol', 20);
 ```
 
-uses a primary-key B+Tree seek, while:
+Before an index:
+
+```text
+mini-sqlite> .explain SELECT name FROM users WHERE age = 20;
+SELECT FROM users USING TABLE SCAN
+```
+
+Create the index:
 
 ```sql
-SELECT * FROM users WHERE age = 20;
+CREATE INDEX idx_users_age ON users(age);
 ```
 
-currently performs a table scan. That visible gap motivates v0.3 secondary indexes.
+Now:
+
+```text
+mini-sqlite> .explain SELECT name FROM users WHERE age = 20;
+SELECT FROM users USING SECONDARY INDEX idx_users_age ON age -> ROWID LOOKUP
+```
+
+The query still returns table rows:
+
+```text
+Alice
+Carol
+```
+
+because the index yields rowids, then the VM seeks the table B+Tree.
+
+## Bytecode makes the back-to-table lookup visible
+
+```text
+ADDR OPCODE             P1   P2   P3 P4
+---- ---------------- ---- ---- ---- ------------------------------------------
+   0 OPEN_READ           0    0    0 'users'
+   1 OPEN_INDEX          1    0    0 'idx_users_age'
+   2 SEEK_INDEX_EQ       1    7    0 20
+   3 INDEX_TO_TABLE      1    0    0
+   4 PROJECT             0    0    0 [1]
+   5 RESULT_ROW          0    0    0
+   6 INDEX_NEXT          1    3    0
+   7 HALT                0    0    0
+```
+
+This is the v0.3 mental model in executable form:
+
+```text
+index seek → rowid → table seek → row
+```
+
+## Why duplicate index values work
+
+For:
+
+```text
+(1, Alice, 20)
+(3, Carol, 20)
+```
+
+the secondary tree does not try to store two identical physical keys `20`. It stores:
+
+```text
+(20, 1)
+(20, 3)
+```
+
+`KeyCodec` encodes the indexed value as a byte prefix and appends an ordered rowid. Equality lookup seeks the shared prefix and walks only that duplicate run.
+
+## Transactional index maintenance
+
+An indexed INSERT is logically:
+
+```text
+insert table row
+      ↓
+insert idx_users_age entry
+      ↓
+insert any other index entries
+      ↓
+COMMIT one Pager transaction
+```
+
+A failure or crash does not leave “table changed but index stale”. Existing v0.2 rollback-journal rules restore all participating pages together.
 
 ## Debug commands
 
 ```text
 .schema
+.indexes
 .pages
 .btree users
-.explain SELECT * FROM users WHERE id = 2;
-.bytecode SELECT * FROM users WHERE id = 2;
+.index idx_users_age
 .txn
+.explain SELECT * FROM users WHERE age = 20;
+.bytecode SELECT * FROM users WHERE age = 20;
 ```
 
-The project intentionally exposes internals because it is meant to be read and inspected.
+`.pages` distinguishes table and index pages:
 
-## Repository learning order
+```text
+LEAF / INTERNAL
+IDX_LEAF / IDX_INTERNAL
+```
 
-For v0.1 fundamentals:
+## Source map
 
-1. `mini_sqlite/storage/record.py`
-2. `mini_sqlite/storage/pager.py`
-3. `mini_sqlite/btree/node.py`
-4. `mini_sqlite/btree/btree.py`
-5. `mini_sqlite/catalog/`
-6. `mini_sqlite/sql/`
-7. `mini_sqlite/planner/`
-8. `mini_sqlite/vm/`
+```text
+mini_sqlite/
+├── database.py
+├── sql/                 SQL → AST
+├── planner/             AST → access path / logical plan
+├── vm/                  Plan → bytecode → execution
+├── catalog/             table + index metadata
+├── btree/               INTEGER-key table/catalog B+Tree
+├── index/
+│   ├── key_codec.py     SQL values → ordered byte prefixes
+│   ├── node.py          variable-key slotted index pages
+│   ├── btree.py         byte-key B+Tree
+│   ├── secondary.py     row/index mapping
+│   └── cursor.py        equality lookup → rowids
+├── storage/
+│   ├── pager.py
+│   ├── journal.py
+│   ├── record.py
+│   └── meta.py
+└── transaction/
+```
 
-Then for v0.2:
+## Recommended reading order
 
-9. `docs/TRANSACTIONS.md`
-10. `mini_sqlite/storage/journal.py`
-11. `mini_sqlite/transaction/manager.py`
-12. `tests/test_transactions.py`
+For fundamentals:
 
-## v0.2 explicit non-goals
+1. `storage/record.py`
+2. `btree/node.py`
+3. `btree/btree.py`
+4. `storage/pager.py`
+5. `docs/TRANSACTIONS.md`
 
-- nested transactions and savepoints;
-- concurrent readers/writers;
-- file locking;
+For v0.3:
+
+6. `docs/INDEXES.md`
+7. `index/key_codec.py`
+8. `index/node.py`
+9. `index/btree.py`
+10. `index/secondary.py`
+11. `catalog/schema.py`
+12. `planner/planner.py`
+13. `vm/compiler.py`
+14. `vm/vm.py`
+15. `tests/test_indexes.py`
+
+## v0.3 explicit non-goals
+
+- UNIQUE indexes;
+- multi-column / expression / partial indexes;
+- range predicates and range index scans;
+- covering/index-only scans;
+- collation configuration;
+- statistics/selectivity/cost model;
+- `UPDATE`, `ORDER BY`, aggregates, `LIMIT`;
+- JOIN;
 - WAL;
-- secondary indexes;
-- joins/aggregates/`ORDER BY`;
-- SQLite binary/journal compatibility;
-- production-grade durability claims across every filesystem/hardware failure model.
+- concurrent connections / locking;
+- SQLite file-format compatibility.
 
-See `Plan.md` for the architecture-driven roadmap. The next milestone is **v0.3: Secondary Indexes + Richer Planner**.
+See `Plan.md`. The next milestone is **v0.4: Relational Execution Engine**.

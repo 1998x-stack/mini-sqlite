@@ -7,6 +7,8 @@ from enum import Enum, auto
 class TokenType(Enum):
     CREATE = auto()
     TABLE = auto()
+    INDEX = auto()
+    ON = auto()
     INSERT = auto()
     INTO = auto()
     VALUES = auto()
@@ -39,6 +41,8 @@ class TokenType(Enum):
 KEYWORDS = {
     "CREATE": TokenType.CREATE,
     "TABLE": TokenType.TABLE,
+    "INDEX": TokenType.INDEX,
+    "ON": TokenType.ON,
     "INSERT": TokenType.INSERT,
     "INTO": TokenType.INTO,
     "VALUES": TokenType.VALUES,

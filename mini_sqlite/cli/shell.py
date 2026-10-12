@@ -35,7 +35,7 @@ def _read_statement(first: str) -> str:
 def repl(path: str | Path) -> None:
     with Database(path) as db:
         recovered = " (hot journal recovered)" if db.pager.recovery_performed else ""
-        print(f"mini-sqlite v0.2.0{recovered} — .help for commands")
+        print(f"mini-sqlite v0.3.0{recovered} — .help for commands")
         while True:
             try:
                 line = input(PROMPT).strip()
@@ -66,9 +66,11 @@ def _meta_command(db: Database, line: str) -> bool:
         return True
     if cmd == ".help":
         print(
-            ".schema              show CREATE TABLE statements\n"
+            ".schema              show CREATE TABLE/INDEX statements\n"
+            ".indexes             show secondary-index metadata\n"
             ".pages               show physical pages\n"
             ".btree TABLE         dump a table B+Tree\n"
+            ".index INDEX         dump a secondary-index B+Tree\n"
             ".txn                 show transaction/journal state\n"
             ".explain SQL         show planner access path\n"
             ".bytecode SQL        compile and disassemble SQL\n"
@@ -76,6 +78,8 @@ def _meta_command(db: Database, line: str) -> bool:
         )
     elif cmd == ".schema":
         print(db.schema_text() or "(empty schema)")
+    elif cmd == ".indexes":
+        print(db.indexes_text() or "(no secondary indexes)")
     elif cmd == ".pages":
         print(db.pages_text())
     elif cmd == ".txn":
@@ -83,6 +87,11 @@ def _meta_command(db: Database, line: str) -> bool:
     elif cmd == ".btree" and len(parts) == 2:
         try:
             print(db.btree_dump(parts[1]))
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
+    elif cmd == ".index" and len(parts) == 2:
+        try:
+            print(db.index_dump(parts[1]))
         except MiniSQLiteError as exc:
             print(f"error: {exc}")
     elif cmd == ".explain" and len(parts) > 1:
