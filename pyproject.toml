@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-sqlite"
+version = "0.1.0"
+description = "A tiny, educational SQLite-inspired database engine built from pages, a B+Tree, SQL frontend, planner, and VM."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "mini-sqlite contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+mini-sqlite = "mini_sqlite.cli.shell:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mini_sqlite*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
