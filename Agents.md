@@ -1,80 +1,146 @@
-# Agents.md — mini-sqlite v0.2 Development Contract
+# Agents.md — mini-sqlite Development Contract
 
-> **Frozen learning snapshot.** Read this file before changing v0.2 code, tests, documentation, or durability behavior.
+> **Mandatory for every future iteration:** read this file before changing code, tests, documentation, branches, version scope, durability protocol, or architecture.
+>
+> This is the canonical engineering contract for `main`. Version branches carry branch-specific `Agents.md` files.
 
-## 1. Version mission
+## 1. Repository mission
 
-v0.2 adds one dominant mental model to the v0.1 engine:
+mini-sqlite is an educational, Python-first database engine for understanding mechanisms behind SQLite-style systems.
 
-> **Atomicity comes from ordering durable writes, not from merely having a `COMMIT` keyword.**
-
-Architecture:
+Priorities:
 
 ```text
-SQL → AST → Plan → Bytecode → VM → B+Tree
-                                  ↓
-                                Pager
-                           ┌───────┴────────┐
-                           ↓                ↓
-                   rollback journal    database file
+architectural clarity
+      ↓
+correctness + explicit invariants
+      ↓
+readable reference implementation
+      ↓
+mechanism-focused tests
+      ↓
+conceptual mapping to SQLite/database systems
+      ↓
+performance and SQL breadth later
 ```
 
-The B+Tree must remain unaware of journal internals.
+Do not optimize for SQLite API/file-format completeness or copy upstream SQLite source.
 
 ## 2. Mandatory reading order
 
+### On `main`
+
 1. `Agents.md`
-2. `version.md`
-3. `docs/TRANSACTIONS.md`
-4. `docs/ARCHITECTURE.md`
-5. `docs/ON_DISK_FORMAT.md`
-6. `tests/test_transactions.py`
-7. `storage/journal.py`
-8. `storage/pager.py`
-9. `transaction/manager.py`
-10. `database.py`
+2. `Plan.md`
+3. `version.md`
+4. relevant architecture/format docs
+5. relevant tests
+6. current implementation
 
-## 3. Branch boundary
+### On a version branch
 
-This branch is the frozen **v0.2 transaction milestone**. Allowed changes are documentation fixes, tests clarifying v0.2 promises, and narrowly scoped defects within rollback-journal semantics.
+1. branch `Agents.md`
+2. branch `version.md`
+3. relevant docs/tests/source
 
-Do not backport v0.3 secondary indexes, v0.4 relational operators, WAL, locking, or later-version features.
+Never assume a historical branch should contain later-version mechanisms.
 
-## 4. Core architecture rules
+## 3. Branch invariant
 
-- SQL syntax must not perform physical I/O.
-- Planner must not know journal mechanics.
-- VM executes plans; it does not call OS file primitives.
-- B+Tree obtains and writes pages only through Pager.
-- Pager owns write ordering and physical durability protocol.
-- TransactionManager owns connection-level transaction state.
-- Catalog/schema state is persisted and must roll back with pages.
-
-## 5. Rollback-journal invariants
-
-For each pre-existing page, capture exactly one before-image before its first transaction-local mutation. New pages need no before-image because rollback truncates to the transaction's original page count.
-
-Commit ordering is:
+`main` must always be the newest integrated, validated state.
 
 ```text
-journal fsync
+latest main
    ↓
-database page writes
+create vX.Y
    ↓
-database fsync
+implement one major database mental model
    ↓
-journal delete  ← commit point
+full tests + docs + example
+   ↓
+freeze version branch
+   ↓
+integrate validated tree into main
+   ↓
+restore canonical main docs
 ```
 
-A surviving journal at startup is treated as hot and recovery restores before-images before normal metadata is read.
+Forbidden: a version branch containing newer validated engine code while `main` remains stale.
 
-## 6. Failure policy
+## 4. Version sequence
 
-v0.2 deliberately has no savepoints. An execution-time error during an explicit transaction aborts and rolls back the whole transaction. Connection close also rolls back an unfinished explicit transaction.
+```text
+v0.1  Page-backed B+Tree + SQL → Planner → VM
+v0.2  Rollback-journal transactions + crash recovery
+v0.3  Secondary indexes + richer planner                 ← next
+v0.4  Relational execution operators
+v0.5  JOIN
+v0.6  WAL
+v0.7  Bounded buffer manager
+v0.8  Cost-based optimizer
+v0.9  Concurrency / locking
+v1.0  Educationally complete mini SQLite
+```
 
-## 7. Testing contract
+One version should introduce one dominant mental model.
 
-Run:
+## 5. Current architecture
+
+```text
+SQL → Parser → AST → Planner → Plan → Compiler → Bytecode → VM
+                                                       │
+                                                       ▼
+                                                     Cursor
+                                                       │
+                                  Catalog ─────────── B+Tree
+                                                       │
+                                                       ▼
+                                                     Pager
+                                               ┌───────┴───────┐
+                                               ▼               ▼
+                                      rollback journal    database file
+```
+
+v0.2 proves crash-atomic transactions can be added at the Pager boundary without contaminating B+Tree/VM/Planner logic.
+
+## 6. Architecture rules
+
+- separate policy from mechanism;
+- SQL frontend never accesses page bytes directly;
+- Planner never performs physical I/O;
+- VM talks to cursors/storage abstractions, not OS files;
+- B+Tree obtains and writes pages only through Pager;
+- Pager owns physical durability ordering;
+- connection transaction state belongs outside B+Tree;
+- schema/index metadata must be persisted, not reconstructed from Python state;
+- root page ids are mutable and owners must persist root changes;
+- future indexes must extend Catalog + Planner + B+Tree boundaries rather than special-case Parser/SELECT;
+- future WAL must replace/extend Pager durability behavior rather than rewrite query layers.
+
+## 7. On-disk protocol rule
+
+Any incompatible byte-layout change requires:
+
+- `FORMAT_VERSION` review/bump;
+- exact layout documentation;
+- corruption and bounds checks;
+- reopen tests;
+- compatibility/migration statement.
+
+A durability-order change is also a protocol change even when page bytes are unchanged.
+
+## 8. Testing contract
+
+Every new subsystem should include, where applicable:
+
+- happy path;
+- invariant/property tests;
+- error-path tests;
+- persistence/reopen validation;
+- fault/crash tests for durability work;
+- end-to-end integration test.
+
+Full regression:
 
 ```bash
 python -m pytest -q
@@ -83,8 +149,57 @@ python examples/transactions.py
 python -m compileall -q mini_sqlite
 ```
 
-Transaction changes require tests for normal commit, explicit rollback, autocommit, hot-journal recovery after dirty pages reach the main file, B+Tree split rollback/truncation, catalog/meta rollback, and corrupted/torn journal behavior where relevant.
+Never claim a version is validated unless the exact reported tree has passed the relevant suite.
 
-## 8. Definition of Done
+## 9. Documentation contract
 
-A v0.2-compatible change is complete only when crash atomicity remains explainable, B+Tree APIs stay durability-agnostic, tests validate reopen/recovery boundaries, docs match exact write ordering, and v0.1 regression behavior stays green.
+When architecture/public API changes, review:
+
+```text
+version.md
+README.md
+Agents.md
+Plan.md
+relevant docs/*
+relevant example
+```
+
+Every version should state its theme, delta from previous release, important source files, recommended reading order, quick-run commands, explicit non-goals, and next-version rationale.
+
+## 10. Historical branch rule
+
+A frozen version branch may receive only documentation corrections, tests clarifying promised behavior, and narrowly scoped bug fixes within that version boundary. Do not backport future subsystems.
+
+## 11. Performance rule
+
+Prefer:
+
+```text
+readable reference
+   ↓
+correctness
+   ↓
+measure/profile
+   ↓
+optimized educational path
+```
+
+Do not obscure page/tree/transaction invariants for premature micro-optimization.
+
+## 12. Generated artifacts and dependencies
+
+Do not commit database files, journals, caches, logs, generated plots, or build artifacts unless a tiny deterministic fixture is explicitly required by tests. Keep the engine standard-library-first; development-only test/lint dependencies are acceptable.
+
+## 13. Definition of Done for a version
+
+A version can be frozen only when the primary mental model is explicit, promised implementation is complete, unit/invariant/error/crash tests pass where relevant, an educational example exists, `version.md` records the delta, branch-specific `Agents.md` exists, architecture/format docs are updated, package imports cleanly, the final branch tree is validated, and the integrated state is restored to `main`.
+
+## 14. Current main directive
+
+`main` contains the completed **v0.2 rollback-journal transaction milestone**.
+
+The next version should be **v0.3: Secondary Indexes + Richer Planner**.
+
+Central question:
+
+> How can a secondary index provide a different ordered access path while INSERT/DELETE and crash recovery keep table and index state atomically consistent?

@@ -1,61 +1,49 @@
-# mini-sqlite v0.2
+# Current integrated state — v0.2
 
-## Theme
+`main` currently contains the validated **v0.2 rollback-journal transaction** implementation on top of the v0.1 page/B+Tree/SQL/VM vertical slice.
 
-**Rollback-journal transactions + crash recovery.**
-
-v0.2 keeps the v0.1 SQL/VM/B+Tree stack intact and inserts durability beneath the B+Tree at the Pager boundary.
+## Integrated architecture
 
 ```text
-B+Tree logical page writes
-          ↓
-        Pager
-      /       \
-before-image  main DB
-   journal
+SQL → AST → Plan → Bytecode → VM → B+Tree → Pager
+                                            ├─ rollback journal
+                                            └─ database file
 ```
 
-## Delta from v0.1
+## Current capabilities
 
-Added:
+- persistent 4 KiB page file;
+- slotted B+Tree leaf/internal pages and splits;
+- persistent catalog;
+- tokenizer/parser/AST/planner/tiny VM;
+- `CREATE`, `INSERT`, `SELECT`, `DELETE`;
+- primary-key seek vs table scan;
+- explicit and autocommit transactions;
+- before-image rollback journal;
+- hot-journal crash recovery;
+- rollback of new pages via truncation;
+- inspection commands for schema/pages/tree/plan/bytecode/transaction state.
 
-- `BEGIN [TRANSACTION]`;
-- `COMMIT` / `END [TRANSACTION]`;
-- `ROLLBACK [TRANSACTION]`;
-- connection transaction state machine;
-- statement autocommit for writes;
-- physical before-image rollback journal;
-- journal-first fsync ordering;
-- hot-journal startup recovery;
-- truncation of transaction-created pages;
-- catalog/meta rollback;
-- Python `with db.transaction():` API;
-- `.txn` shell inspection;
-- crash/fault-oriented transaction tests.
+## Reading order
 
-## Important source files
+For storage/query basics, read v0.1 layers first. For the newest mechanism, read:
 
-- `mini_sqlite/storage/journal.py`
-- `mini_sqlite/storage/pager.py`
-- `mini_sqlite/transaction/manager.py`
-- `mini_sqlite/database.py`
-- `tests/test_transactions.py`
-- `docs/TRANSACTIONS.md`
+1. `docs/TRANSACTIONS.md`
+2. `mini_sqlite/storage/journal.py`
+3. `mini_sqlite/storage/pager.py`
+4. `mini_sqlite/transaction/manager.py`
+5. `mini_sqlite/database.py`
+6. `tests/test_transactions.py`
 
-## Recommended reading order
+## Validation commands
 
-1. v0.1 storage/B+Tree path
-2. `docs/TRANSACTIONS.md`
-3. `storage/journal.py`
-4. `storage/pager.py`
-5. `transaction/manager.py`
-6. `database.py`
-7. `tests/test_transactions.py`
-
-## Non-goals
-
-No nested transactions/savepoints, concurrent connections, file locks, WAL, secondary indexes, statement-level rollback inside an explicit transaction, or SQLite journal compatibility.
+```bash
+python -m pytest -q
+python examples/quickstart.py
+python examples/transactions.py
+python -m compileall -q mini_sqlite
+```
 
 ## Next
 
-v0.3 should add **secondary indexes + richer planner access paths** while preserving Pager/transaction boundaries.
+See `Plan.md`: **v0.3 Secondary Indexes + Richer Planner**.
