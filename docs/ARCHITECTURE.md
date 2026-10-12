@@ -165,7 +165,7 @@ for each column:
 payload bytes...
 ```
 
-Tags in v0.1:
+Record tags:
 
 ```text
 0 NULL
@@ -201,7 +201,7 @@ This tiny distinction is enough to demonstrate why a secondary index matters in 
 
 ## 11. VM
 
-The VM is intentionally register-light in v0.1. Its opcodes include:
+The VM is intentionally register-light. Its opcodes include:
 
 ```text
 CREATE_TABLE
@@ -220,22 +220,20 @@ HALT
 
 The compiler emits control-flow addresses into instructions. `REWIND`, `SEEK_PK`, `FILTER_EQ`, and `NEXT` can alter the program counter.
 
-## 12. Durability boundary
+## 12. Durability boundary — v0.2
 
-v0.1 flushes and fsyncs after a statement. This means completed page writes are durable, but a crash during a multi-page mutation can still leave partial structural changes.
-
-v0.2 should solve this below the B+Tree with a rollback journal:
+v0.2 inserts rollback-journal durability below the B+Tree:
 
 ```text
 BTree mutation
     ↓
 Pager.write_page
     ↓
-if first write to page in transaction:
-    save old page to journal
-    fsync journal
-    mark journal ready
-    write database page
+first write to old page? ── yes ──→ append before-image to journal
+    ↓
+commit: journal fsync → DB flush/fsync → journal delete
 ```
 
-That design keeps transaction recovery out of SQL and B+Tree logic.
+New pages do not need before-images; the journal records the database page count at `BEGIN`, so rollback/recovery truncates transaction-created pages. A hot journal is recovered before page 0 metadata is decoded.
+
+See `TRANSACTIONS.md` for the exact protocol and simplifications.

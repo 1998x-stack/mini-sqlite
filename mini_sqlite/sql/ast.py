@@ -37,4 +37,27 @@ class DeleteStmt:
     where: EqualityPredicate | None = None
 
 
-Statement = CreateTableStmt | InsertStmt | SelectStmt | DeleteStmt
+@dataclass(frozen=True)
+class BeginStmt:
+    pass
+
+
+@dataclass(frozen=True)
+class CommitStmt:
+    pass
+
+
+@dataclass(frozen=True)
+class RollbackStmt:
+    pass
+
+
+Statement = (
+    CreateTableStmt
+    | InsertStmt
+    | SelectStmt
+    | DeleteStmt
+    | BeginStmt
+    | CommitStmt
+    | RollbackStmt
+)

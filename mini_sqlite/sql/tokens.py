@@ -19,6 +19,11 @@ class TokenType(Enum):
     INTEGER = auto()
     TEXT = auto()
     NULL = auto()
+    BEGIN = auto()
+    TRANSACTION = auto()
+    COMMIT = auto()
+    END = auto()
+    ROLLBACK = auto()
     IDENT = auto()
     NUMBER = auto()
     STRING = auto()
@@ -46,6 +51,11 @@ KEYWORDS = {
     "INTEGER": TokenType.INTEGER,
     "TEXT": TokenType.TEXT,
     "NULL": TokenType.NULL,
+    "BEGIN": TokenType.BEGIN,
+    "TRANSACTION": TokenType.TRANSACTION,
+    "COMMIT": TokenType.COMMIT,
+    "END": TokenType.END,
+    "ROLLBACK": TokenType.ROLLBACK,
 }
 
 

@@ -3,10 +3,13 @@ from __future__ import annotations
 from mini_sqlite.catalog.schema import Column, ColumnType
 from mini_sqlite.errors import ParseError
 from mini_sqlite.sql.ast import (
+    BeginStmt,
+    CommitStmt,
     CreateTableStmt,
     DeleteStmt,
     EqualityPredicate,
     InsertStmt,
+    RollbackStmt,
     SelectStmt,
     Statement,
 )
@@ -29,6 +32,16 @@ class Parser:
             stmt = self._select()
         elif token_type == TokenType.DELETE:
             stmt = self._delete()
+        elif token_type == TokenType.BEGIN:
+            stmt = self._begin()
+        elif token_type in (TokenType.COMMIT, TokenType.END):
+            self._advance()
+            self._match(TokenType.TRANSACTION)
+            stmt = CommitStmt()
+        elif token_type == TokenType.ROLLBACK:
+            self._advance()
+            self._match(TokenType.TRANSACTION)
+            stmt = RollbackStmt()
         else:
             raise self._error(f"unsupported statement starting with {self.current.value!r}")
         self._match(TokenType.SEMICOLON)
@@ -68,6 +81,11 @@ class Parser:
             self._advance()
             return None
         raise self._error("expected literal")
+
+    def _begin(self) -> BeginStmt:
+        self._expect(TokenType.BEGIN)
+        self._match(TokenType.TRANSACTION)
+        return BeginStmt()
 
     def _create_table(self) -> CreateTableStmt:
         self._expect(TokenType.CREATE)

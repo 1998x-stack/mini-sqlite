@@ -1,4 +1,4 @@
-# v0.1 on-disk format
+# mini-sqlite database on-disk format (v0.1–v0.2)
 
 This file documents the educational format. It is **not** SQLite-compatible.
 
@@ -67,3 +67,8 @@ Integer payload is signed 64-bit little-endian. Text payload is UTF-8.
 ## Format-version policy
 
 Any incompatible change to these layouts must increment `FORMAT_VERSION` in `mini_sqlite/constants.py`.
+
+
+## v0.2 rollback-journal sidecar
+
+The main database page format is unchanged in v0.2. During a write transaction, `<database>-journal` contains a header plus complete before-image entries. See `TRANSACTIONS.md`. The journal is a recovery sidecar, not part of the persistent committed database format.

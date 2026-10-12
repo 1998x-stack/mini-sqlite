@@ -14,6 +14,10 @@ class StorageError(MiniSQLiteError):
     pass
 
 
+class TransactionError(MiniSQLiteError):
+    pass
+
+
 class DuplicateKeyError(MiniSQLiteError):
     pass
 

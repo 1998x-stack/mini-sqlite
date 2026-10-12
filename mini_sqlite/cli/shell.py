@@ -34,7 +34,8 @@ def _read_statement(first: str) -> str:
 
 def repl(path: str | Path) -> None:
     with Database(path) as db:
-        print("mini-sqlite v0.1.0 — .help for commands")
+        recovered = " (hot journal recovered)" if db.pager.recovery_performed else ""
+        print(f"mini-sqlite v0.2.0{recovered} — .help for commands")
         while True:
             try:
                 line = input(PROMPT).strip()
@@ -68,6 +69,7 @@ def _meta_command(db: Database, line: str) -> bool:
             ".schema              show CREATE TABLE statements\n"
             ".pages               show physical pages\n"
             ".btree TABLE         dump a table B+Tree\n"
+            ".txn                 show transaction/journal state\n"
             ".explain SQL         show planner access path\n"
             ".bytecode SQL        compile and disassemble SQL\n"
             ".quit/.exit          leave the shell"
@@ -76,6 +78,8 @@ def _meta_command(db: Database, line: str) -> bool:
         print(db.schema_text() or "(empty schema)")
     elif cmd == ".pages":
         print(db.pages_text())
+    elif cmd == ".txn":
+        print(db.transaction_status())
     elif cmd == ".btree" and len(parts) == 2:
         try:
             print(db.btree_dump(parts[1]))
