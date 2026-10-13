@@ -1,70 +1,49 @@
-# mini-sqlite v1.2.0 — Free-list Page Reuse + Incremental VACUUM
+# Current integrated state — v1.2
 
-## Status
+`main` contains the validated **v1.2 Free-list Page Reuse + Incremental VACUUM** engine.
 
-**Implemented / frozen candidate.**
-
-v1.2 closes the fixed-page storage lifecycle: pages can now be explicitly released, persisted on a free-list, reused by later allocations, and physically truncated when free pages reach the file tail.
-
-## Main mental model
+## Integrated capability
 
 ```text
-owned page
-   ↓
-free_page()
-   ↓
-persistent free-list
-   ↓
-allocate_page()
-   ├─ reuse
-   └─ extend file
-
-free tail suffix
-   ↓
-incremental_vacuum()
-   ↓
-physical space reclaimed
+SQL / Parser / AST
+        ↓
+Cost-Based Planner ← ANALYZE
+        ↓
+Compiler / VM → relational operators / JOIN
+        ↓
+Table + Secondary-Index B+Trees
+        ↓
+Pager
+ ┌──────┼──────────────┐
+ ↓      ↓              ↓
+Buffer  Free-list      Rollback/WAL
+Pool    reuse/trim     durability
+        ↓
+   database file
 ```
 
-## New capabilities
+Concurrency includes process-local locks plus POSIX `flock`. Lifecycle tooling includes integrity checking, REINDEX, full VACUUM, incremental VACUUM and EXPLAIN ANALYZE.
 
-- database metadata format v2;
-- page-0 `free_list_head`;
+## v1.2 additions
+
+- metadata format v2 with persistent `free_list_head`;
 - `MSQLFREE` linked free-page format;
-- transactional page deallocation;
-- allocation prefers free pages;
+- transactional `free_page()`;
+- `allocate_page()` reuses free pages before extending the file;
 - REINDEX returns old index-tree pages to the free-list;
-- integrity checker validates free-list structure and ownership;
-- `.freelist` and `FREE` page display;
-- incremental tail-page vacuum with optional limit;
-- rollback-journal crash-safe truncation;
-- WAL logical page-count shrink + checkpoint truncate;
-- read/upgrade path for format-v1 databases.
+- integrity checker validates free-list ownership/cycles/pointers;
+- `.freelist` and `FREE` page inspection;
+- `incremental_vacuum(max_pages)` for free file-tail suffixes;
+- rollback crash recovery after physical tail truncation;
+- WAL logical shrink followed by checkpoint physical truncate;
+- format-v1 read/upgrade path.
 
-## Compatibility
+## Validation
 
-v1.2 reads format-v1 mini-sqlite databases. New databases use format 2. An opened v1 database is upgraded in memory and is persisted as format 2 when metadata/free-list semantics are next written.
-
-Unchanged:
-
-- 4 KiB page size;
-- table/catalog B+Tree page layout;
-- secondary-index B+Tree page layout;
-- row record encoding;
-- rollback-journal format;
-- WAL format;
-- v1.1 lock sidecars.
-
-## Validation target
-
-- all v0.1–v1.1 regression tests;
-- dedicated free-list/reuse/incremental-vacuum tests;
-- rollback and WAL crash/reopen cases;
-- format-v1 upgrade case;
-- free-list smoke example;
-- Python 3.10 / 3.12 exact branch-head CI;
-- `compileall`.
+The frozen `v1.2` branch passed the exact GitHub CI matrix on Python 3.10 and 3.12 with 122 tests, all smoke examples through `examples/freelist.py`, and compileall.
 
 ## Next
 
-**v1.3 — Range Index Scan + Composite Index**: turn the secondary-index layer from equality-only lookup into ordered-range access and multi-column keys, then expose those choices to the cost-based planner.
+`v1.3 — Range Index Scan + Composite Index`
+
+The next dominant question is how an ordered secondary-index structure supports `< <= > >=` ranges and multi-column keys, and how the cost-based planner decides when those access paths beat a table scan.
