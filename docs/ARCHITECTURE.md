@@ -4,164 +4,132 @@
 
 ```text
 Database.execute(sql)
-        │
-        ▼
-      Parser
-        │
-        ▼
-       AST
-        │
-        ▼
-     Planner ───────────── binding + access path + join algorithm + relational stages
-        │
-        ▼
-       Plan
-        │
-        ▼
-    Compiler
-        │
-        ▼
-   Instruction[]
-        │
-        ▼
- VirtualMachine
-   │          │
-   │          ├────────────── joined row working set
-   │          │
-   ▼          ▼
-Table       Index Cursor
-Cursor         │
-   │           ▼
-   ▼        byte-key B+Tree
-integer-key    │
-B+Tree         │
-   └──────┬────┘
-          ▼
-        Pager
-   ┌──────┴──────┐
-   ▼             ▼
-rollback      database
-journal         file
-```
-
-Parser and Planner never read page bytes. JOIN is implemented by composing existing table/index cursors, not by adding a new storage primitive.
-
-## 2. Storage remains unchanged in v0.5
-
-v0.5 introduces no new page type or database-file layout. It retains:
-
-- page 0 metadata;
-- INTEGER-key table/catalog B+Tree pages;
-- byte-key secondary-index B+Tree pages;
-- JSON catalog table/index metadata;
-- rollback-journal before-images.
-
-Joined rows are transient VM tuples only.
-
-## 3. Planner responsibilities
-
-The Planner now performs four visibly separate jobs:
-
-```text
-name binding
-    ↓
-physical source/access selection
-    ↓
-JOIN inner-path selection
-    ↓
-post-source relational metadata
-```
-
-For a single table, access remains:
-
-```text
-PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN
-```
-
-For v0.5 JOIN, the written left source remains outer. The right ON column selects:
-
-```text
-right primary key       -> indexed nested loop via PK seek
-right secondary index   -> indexed nested loop via index seek + rowid lookup
-otherwise               -> nested loop via right table scan
-```
-
-There is deliberately no cost model or join reordering yet.
-
-## 4. Joined row representation
-
-Two physical table records are decoded independently and combined only in VM memory:
-
-```text
-(left columns..., right columns...)
-```
-
-Planner name binding maps SQL references onto flat indexes in this transient row. Therefore v0.4 operators can be reused unchanged:
-
-```text
-FILTER_ROWS
-SORT_ROWS
-PROJECT_ROWS
-AGGREGATE_ROWS
-LIMIT_ROWS
-EMIT_ROWS
-```
-
-## 5. JOIN bytecode
-
-Plain nested loop exposes both cursor loops:
-
-```text
-REWIND left
-REWIND right
-FILTER_JOIN_EQ
-COLLECT_JOIN_ROW
-NEXT right
-NEXT left
-```
-
-Primary-key indexed nested loop replaces the full inner loop with:
-
-```text
-SEEK_PK_FROM_COLUMN
-COLLECT_JOIN_ROW
-```
-
-Secondary-index nested loop uses:
-
-```text
-SEEK_INDEX_FROM_COLUMN
-INDEX_TO_TABLE
-COLLECT_JOIN_ROW
-INDEX_NEXT
-```
-
-The VM, rather than B+Tree, owns this composition.
-
-## 6. Durability layering remains intact
-
-JOIN is read-only. Existing write paths still use v0.2 rollback-journal transactions, and table/index maintenance from v0.3/v0.4 is unchanged.
-
-That layering is intentional:
-
-```text
-query semantics / JOIN
         ↓
-cursors / B+Trees
-        ↓
-Pager durability
+Parser -> AST -> Planner -> Plan -> Compiler -> Instruction[] -> VM
+                                                    │
+                       ┌────────────────────────────┴─────────────────────┐
+                       ▼                                                  ▼
+                 Table Cursor                                       Index Cursor
+                       │                                                  │
+                       ▼                                                  ▼
+              integer-key B+Tree                                  byte-key B+Tree
+                       └────────────────────────┬─────────────────────────┘
+                                                ▼
+                                              Pager
+                         ┌───────────────────────┴───────────────────────┐
+                         ▼                                               ▼
+                  rollback mode                                     WAL mode
+            before-image journal                             committed after-images
+                         │                                               │
+                         ▼                                               ▼
+                  database file                              read overlay / checkpoint
+                                                                         │
+                                                                         ▼
+                                                                  database file
 ```
 
-v0.6 WAL should replace/extend the bottom durability mechanism without rewriting JOIN or planner semantics.
+Parser, Planner, VM and B+Trees never read or write OS files directly. Pager is the durability boundary.
 
-## 7. Cross-version layering invariant
+## 2. Query layers remain unchanged in v0.6
+
+v0.6 changes no SQL semantics, row layout, B+Tree page format, catalog encoding, index key format, or JOIN algorithm. It adds a second durability policy below those mechanisms.
+
+That boundary is the core lesson:
+
+```text
+query meaning
+   ↓
+logical page operations
+   ↓
+Pager durability policy
+```
+
+## 3. Rollback mode
+
+v0.2 before-image flow remains available and is still the default:
+
+```text
+capture old page
+      ↓
+fsync rollback journal
+      ↓
+write DB page
+      ↓
+fsync DB
+      ↓
+delete journal
+```
+
+## 4. WAL mode
+
+v0.6 changes commit ordering:
+
+```text
+cached new page versions
+      ↓
+append FRAME after-images
+      ↓
+append transaction COMMIT record
+      ↓
+fsync WAL
+      ↓
+logical commit visible
+```
+
+The main DB is not required to contain the newest committed version until checkpoint.
+
+## 5. Pager read overlay
+
+```text
+page id
+  ↓
+cache?
+  ├─ yes -> cache
+  └─ no
+       ↓
+latest committed WAL frame?
+  ├─ yes -> WAL bytes
+  └─ no  -> main DB bytes
+```
+
+Table/index/catalog code therefore needs no WAL-specific branches.
+
+## 6. Checkpoint
+
+```text
+WAL newest-page map
+       ↓
+copy to main DB
+       ↓
+set committed logical file length
+       ↓
+fsync DB
+       ↓
+reset WAL
+```
+
+Keeping WAL until DB fsync makes a partial-checkpoint crash recoverable: the WAL still overlays the complete committed state.
+
+## 7. Logical vs physical page count
+
+In WAL mode, committed frames may describe pages beyond the current main-file EOF. Pager therefore distinguishes:
+
+```text
+physical database page count
+logical committed page count
+```
+
+The logical count may be larger until checkpoint extends the main file.
+
+## 8. Cross-version layering invariant
 
 ```text
 v0.1  pages + primary B+Tree + SQL/VM
-v0.2  Pager rollback journal
+v0.2  rollback-journal durability
 v0.3  secondary index access path
 v0.4  relational row-processing stages
 v0.5  two-source JOIN composition
+v0.6  alternative WAL durability below Pager
 ```
 
 Each version adds a mechanism at the narrowest useful boundary instead of replacing earlier layers.

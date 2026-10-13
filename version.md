@@ -1,65 +1,56 @@
-# Current integrated state — v0.5
+# mini-sqlite v0.6
 
-`main` currently contains the validated **v0.5 INNER JOIN + indexed nested-loop** implementation on top of the v0.1 page/B+Tree/SQL/VM, v0.2 rollback-journal transaction, v0.3 secondary-index, and v0.4 relational-execution foundations.
+## Theme
 
-## Integrated architecture
+**Write-Ahead Logging through committed page after-images, read overlay, and checkpoint.**
+
+v0.2 taught rollback with old page images. v0.6 adds the complementary model:
 
 ```text
-SQL → AST → Planner
-          │
-          ├─ single source: PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN
-          ├─ JOIN inner:    PK seek / index seek / table scan
-          └─ filter / sort / aggregate-project / limit metadata
-                               ↓
-                         Compiler → VM
-                               ↓
-outer source → inner lookup/scan → JOIN
-                               ↓
-filter → sort → aggregate/project → limit → emit
-                               ↓
-                 table/index B+Trees → Pager
-                                      ├─ rollback journal
-                                      └─ database file
+rollback journal: old page -> main DB may be overwritten -> undo on crash
+WAL:              new page -> append log first          -> replay/overlay on reopen
 ```
 
-## Current capabilities
+## Delta from v0.5
 
-- persistent 4 KiB page file;
-- slotted table/catalog B+Tree and secondary-index B+Tree;
-- tokenizer/parser/AST/planner/tiny VM;
-- explicit/autocommit rollback-journal transactions and hot-journal recovery;
-- `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `DELETE`, `UPDATE`;
-- primary-key equality lookup, secondary-index equality lookup, table scan;
-- predicates `= != < <= > >=`;
-- `ORDER BY ... ASC/DESC`, `LIMIT`, scalar `COUNT/SUM/MIN/MAX`;
-- transactional maintenance of every secondary index during writes;
-- `JOIN` / `INNER JOIN` for one two-table join per SELECT;
-- table aliases and qualified column references;
-- ambiguity detection for unqualified names;
-- self-join with distinct aliases;
-- plain nested-loop join;
-- primary-key indexed nested-loop join;
-- secondary-index indexed nested-loop join with duplicate inner matches;
-- explicit JOIN opcodes `SEEK_PK_FROM_COLUMN`, `SEEK_INDEX_FROM_COLUMN`, `FILTER_JOIN_EQ`, `COLLECT_JOIN_ROW`;
-- JOIN rows reuse v0.4 filter/sort/aggregate/project/limit stages;
-- schema/page/tree/index/plan/bytecode/transaction inspection commands.
+Added:
 
-## Recommended reading order for the latest mechanism
+- `Database(..., journal_mode="rollback" | "wal")`;
+- documented WAL file format;
+- physical page after-image frames;
+- transaction COMMIT records;
+- CRC validation and tail-bound checks;
+- newest-committed-frame read overlay;
+- WAL-safe in-memory rollback for active transactions;
+- committed WAL reconstruction across reopen;
+- torn/uncommitted-tail truncation;
+- explicit checkpoint to main database;
+- crash-safe partial-checkpoint behavior while WAL remains;
+- WAL -> rollback mode switching through checkpoint;
+- `.wal` and `.checkpoint` shell commands;
+- `docs/WAL.md`, `examples/wal.py`, `tests/test_wal.py`.
 
-1. `docs/JOINS.md`
-2. `mini_sqlite/sql/ast.py`
-3. `mini_sqlite/sql/parser.py`
-4. `mini_sqlite/planner/plan.py`
-5. `mini_sqlite/planner/planner.py`
-6. `mini_sqlite/vm/compiler.py`
-7. `mini_sqlite/vm/opcode.py`
-8. `mini_sqlite/vm/vm.py`
-9. `tests/test_joins.py`
-10. `examples/joins.py`
+## Important source files
 
-For earlier mechanisms, read `docs/TRANSACTIONS.md`, `docs/INDEXES.md`, and `docs/RELATIONAL_ENGINE.md`.
+- `mini_sqlite/storage/wal.py`
+- `mini_sqlite/storage/pager.py`
+- `mini_sqlite/transaction/manager.py`
+- `mini_sqlite/database.py`
+- `mini_sqlite/cli/shell.py`
+- `tests/test_wal.py`
+- `docs/WAL.md`
 
-## Validation commands
+## Recommended reading order
+
+1. `docs/TRANSACTIONS.md`
+2. `docs/WAL.md`
+3. `storage/wal.py`
+4. `storage/pager.py`
+5. `transaction/manager.py`
+6. `tests/test_wal.py`
+7. `examples/wal.py`
+
+## Validation
 
 ```bash
 python -m pytest -q
@@ -68,13 +59,18 @@ python examples/transactions.py
 python examples/indexes.py
 python examples/relational.py
 python examples/joins.py
+python examples/wal.py
 python -m compileall -q mini_sqlite
 ```
 
 ## Storage compatibility
 
-v0.5 introduces no on-disk format change. Existing database pages, catalog metadata, secondary-index pages, and rollback journal remain v0.4-compatible.
+The main database page layout is unchanged from v0.5. v0.6 adds a new sidecar protocol, `<database>-wal`. It is intentionally **not binary-compatible with SQLite WAL**.
+
+## Explicit non-goals
+
+No concurrent connections, multi-writer locking, SQLite `-shm`, reader snapshots, automatic checkpoint scheduling, WAL index shared memory, production SQLite WAL compatibility, bounded buffer replacement, or cost-based optimization.
 
 ## Next
 
-See `Plan.md`: **v0.6 WAL** — an educational after-image write-ahead log, committed-frame read overlay, crash recovery, inspection, and checkpointing below the unchanged B+Tree/query layers.
+v0.7 should add a **bounded buffer manager** so page caching becomes an explicit resource-management problem: capacity, pin/unpin, hit/miss accounting, dirty eviction, and LRU/Clock replacement.

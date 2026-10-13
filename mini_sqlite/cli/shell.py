@@ -32,10 +32,12 @@ def _read_statement(first: str) -> str:
     return "\n".join(parts)
 
 
-def repl(path: str | Path) -> None:
-    with Database(path) as db:
-        recovered = " (hot journal recovered)" if db.pager.recovery_performed else ""
-        print(f"mini-sqlite v0.3.0{recovered} — .help for commands")
+def repl(path: str | Path, *, journal_mode: str = "rollback") -> None:
+    with Database(path, journal_mode=journal_mode) as db:
+        recovered = " (recovery performed)" if db.pager.recovery_performed else ""
+        print(
+            f"mini-sqlite v0.6.0 mode={db.pager.journal_mode}{recovered} — .help for commands"
+        )
         while True:
             try:
                 line = input(PROMPT).strip()
@@ -71,7 +73,9 @@ def _meta_command(db: Database, line: str) -> bool:
             ".pages               show physical pages\n"
             ".btree TABLE         dump a table B+Tree\n"
             ".index INDEX         dump a secondary-index B+Tree\n"
-            ".txn                 show transaction/journal state\n"
+            ".txn                 show transaction/durability state\n"
+            ".wal                 show WAL state\n"
+            ".checkpoint          checkpoint committed WAL frames\n"
             ".explain SQL         show planner access path\n"
             ".bytecode SQL        compile and disassemble SQL\n"
             ".quit/.exit          leave the shell"
@@ -84,6 +88,14 @@ def _meta_command(db: Database, line: str) -> bool:
         print(db.pages_text())
     elif cmd == ".txn":
         print(db.transaction_status())
+    elif cmd == ".wal":
+        print(db.wal_status())
+    elif cmd == ".checkpoint":
+        try:
+            copied = db.checkpoint()
+            print(f"checkpointed {copied} page(s)")
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
     elif cmd == ".btree" and len(parts) == 2:
         try:
             print(db.btree_dump(parts[1]))
@@ -112,8 +124,14 @@ def _meta_command(db: Database, line: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Educational SQLite-inspired database")
     parser.add_argument("database", nargs="?", default="mini.db")
+    parser.add_argument(
+        "--journal-mode",
+        choices=["rollback", "wal"],
+        default="rollback",
+        help="durability mode (default: rollback)",
+    )
     args = parser.parse_args()
-    repl(args.database)
+    repl(args.database, journal_mode=args.journal_mode)
 
 
 if __name__ == "__main__":

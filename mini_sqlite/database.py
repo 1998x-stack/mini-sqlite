@@ -35,9 +35,9 @@ class QueryResult:
 class Database:
     """Facade joining SQL frontend, planner, VM, B+Tree, Pager and transactions."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, journal_mode: str = "rollback"):
         self.path = Path(path)
-        self.pager = Pager(self.path)
+        self.pager = Pager(self.path, journal_mode=journal_mode)
         self.meta = self._open_or_initialize()
         self.tx = TransactionManager(self.pager)
         self._install_runtime()
@@ -81,8 +81,6 @@ class Database:
 
     def rollback(self) -> None:
         self.tx.rollback()
-        # Catalog/meta objects may have been changed by CREATE TABLE or a B+Tree
-        # root split. Rebuild them from the restored page cache after rollback.
         self._reload_runtime()
 
     @contextmanager
@@ -115,9 +113,9 @@ class Database:
         self._last_code = code
         self._last_explain = self.planner.explain(plan)
 
-        # Read-only statements need no rollback journal in autocommit mode.
-        # Any write statement outside BEGIN gets its own durable transaction.
-        autocommit_write = not self.in_transaction and not isinstance(plan, (SelectPlan, JoinSelectPlan))
+        autocommit_write = not self.in_transaction and not isinstance(
+            plan, (SelectPlan, JoinSelectPlan)
+        )
         if autocommit_write:
             self.begin()
 
@@ -126,8 +124,6 @@ class Database:
             if autocommit_write:
                 self.commit()
         except BaseException:
-            # v0.2+ chooses a simple, safe policy: execution failure aborts the
-            # whole active transaction rather than implementing statement savepoints.
             if self.in_transaction:
                 self.rollback()
             raise
@@ -165,9 +161,7 @@ class Database:
                 cols.append(f"{col.name} {col.type.value}{suffix}")
             chunks.append(f"CREATE TABLE {table.name} ({', '.join(cols)});")
             for index in table.indexes:
-                chunks.append(
-                    f"CREATE INDEX {index.name} ON {table.name}({index.column});"
-                )
+                chunks.append(f"CREATE INDEX {index.name} ON {table.name}({index.column});")
         return "\n".join(chunks)
 
     def indexes_text(self) -> str:
@@ -215,23 +209,37 @@ class Database:
 
     def transaction_status(self) -> str:
         stats = self.pager.stats()
+        if self.pager.journal_mode == "wal":
+            wal = self.pager.wal_stats()
+            return (
+                f"state={self.tx.state.value} mode=wal wal={self.pager.wal_path.name} "
+                f"dirty_pages={stats['transaction_dirty_pages']} "
+                f"committed_frames={wal['committed_frames']} "
+                f"recovered_on_open={stats['recovery_performed']}"
+            )
         return (
-            f"state={self.tx.state.value} journal={self.pager.journal_path.name} "
+            f"state={self.tx.state.value} mode=rollback journal={self.pager.journal_path.name} "
             f"journaled_pages={stats['journaled_pages']} "
             f"recovered_on_open={stats['recovery_performed']}"
         )
 
-    def flush(self) -> None:
-        """Force dirty pages to disk without committing an active transaction.
+    def wal_status(self) -> str:
+        stats = self.pager.wal_stats()
+        return (
+            f"mode={stats['mode']} wal={self.pager.wal_path.name} "
+            f"exists={stats['wal_exists']} txns={stats['committed_transactions']} "
+            f"frames={stats['committed_frames']} overlay_pages={stats['overlay_pages']} "
+            f"bytes={stats['wal_bytes']}"
+        )
 
-        This exists mainly to make the rollback protocol observable in teaching
-        and crash tests. A hot journal still guarantees recovery after this call.
-        """
+    def checkpoint(self) -> int:
+        return self.pager.checkpoint()
+
+    def flush(self) -> None:
+        """Flush what the active durability mode safely permits."""
         self.pager.flush_all()
 
     def close(self) -> None:
-        # TransactionManager mirrors Pager state; close must preserve "uncommitted
-        # means rolled back" semantics while leaving no stale manager state.
         if self.in_transaction:
             self.rollback()
         self.pager.close()

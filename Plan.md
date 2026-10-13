@@ -15,7 +15,7 @@ primary B+Tree
       ↓
 SQL / planner / VM
       ↓
-transactions / recovery
+rollback recovery
       ↓
 secondary indexes
       ↓
@@ -52,165 +52,103 @@ UPDATE, richer comparisons, ORDER BY, LIMIT, scalar aggregates, explicit materia
 
 ### v0.5 — INNER JOIN + Indexed Nested Loop ✅
 
-Central question:
+Aliases, qualified names, ambiguity detection, self-join, plain nested loop, PK indexed nested loop, secondary-index nested loop, post-JOIN relational stages.
 
-> How can two row sources be composed while keeping name resolution, physical access paths, and join algorithms explicit?
+### v0.6 — WAL + read overlay + checkpoint ✅
 
 Implemented:
 
-- `JOIN` / `INNER JOIN`;
-- table aliases and qualified names;
-- ambiguity detection and self-join aliases;
-- equality ON predicate between the two sources;
-- plain nested-loop reference algorithm;
-- primary-key indexed nested loop;
-- secondary-index indexed nested loop;
-- duplicate inner matches;
-- explicit JOIN bytecode rather than an opaque helper;
-- joined rows flowing through v0.4 filter/sort/project/aggregate/limit;
-- no on-disk format change.
+- explicit rollback/WAL durability mode;
+- documented WAL sidecar format;
+- full-page after-image FRAME records;
+- transaction COMMIT records carrying logical page count and frame count;
+- CRC validation and bounds checking;
+- newest committed frame overlay on Pager reads;
+- private in-memory rollback before WAL commit;
+- torn/uncommitted WAL tail recovery;
+- multiple committed transactions per WAL;
+- checkpoint ordering that keeps WAL until database fsync;
+- partial-checkpoint crash recovery;
+- pages/root splits beyond main-file EOF;
+- WAL -> rollback mode switch through checkpoint;
+- `.wal` / `.checkpoint` inspection;
+- no query/B+Tree rewrite above Pager.
 
-## 3. Current next milestone — v0.6 WAL 🎯
+## 3. Current next milestone — v0.7 Buffer Manager 🎯
 
 ### Central question
 
-> How can committed changes be made durable by appending new page images to a log first, while readers still reconstruct the newest database view and checkpoints eventually fold frames back into the main file?
+> What changes when the database can no longer keep every touched page in memory, and page residency becomes a bounded resource that must be pinned, evicted, measured, and written back safely?
 
-v0.2 established rollback-journal **before images**. v0.6 should deliberately contrast that with WAL **after images**.
+v0.1-v0.6 use an effectively unbounded Python dictionary cache. v0.7 should turn that hidden convenience into an explicit subsystem.
 
 ### Target architecture
 
 ```text
-                 read page N
-                     │
-                     ▼
-              WAL frame lookup?
-                /          \
-              yes          no
-              │             │
-              ▼             ▼
-        newest WAL frame   main db page
-              \             /
-               \           /
-                 Pager view
-
-writer:
-page mutation
-    ↓
-append WAL frame
-    ↓
-append commit marker / commit boundary
-    ↓
-fsync WAL
-
-checkpoint:
-committed WAL frames
-    ↓
-copy newest page versions to database file
-    ↓
-fsync database
-    ↓
-reset/truncate WAL when safe
+B+Tree / Index / Catalog
+          ↓
+       Pager API
+          ↓
+    Buffer Manager
+  ┌────────┼─────────┐
+  ▼        ▼         ▼
+frames   replacer   stats
+  │      LRU/Clock   hit/miss
+  │
+  ├─ pin count
+  ├─ dirty bit
+  └─ page id
+          ↓
+ durability layer
+ rollback / WAL
+          ↓
+      disk files
 ```
 
-### v0.6.1 WAL file format
+### v0.7.1 bounded frames
 
-Define a small, documented format containing at minimum:
+Introduce a configurable capacity, for example:
 
-- magic/version;
-- database page size;
-- frame sequence/order;
-- target page id;
-- page image;
-- transaction/commit boundary metadata;
-- integrity/bounds validation sufficient for educational recovery tests.
+```python
+Database("demo.db", buffer_pages=32)
+```
 
-Any durable protocol is part of the format contract even if main database page bytes remain unchanged.
+The buffer manager owns a fixed number of frames rather than allowing `_cache` to grow forever.
 
-### v0.6.2 write path
+### v0.7.2 pin / unpin
 
-A write transaction in WAL mode should not overwrite committed database pages before WAL durability.
-
-Conceptual sequence:
+A page currently in use by a cursor/tree operation cannot be evicted.
 
 ```text
-dirty logical page
-      ↓
-append after-image frame
-      ↓
-commit boundary
-      ↓
-fsync WAL
-      ↓
-transaction visible as committed
+fetch page -> pin_count += 1 -> use page -> unpin -> pin_count -= 1
 ```
 
-Do not mix rollback-journal and WAL ordering implicitly. Make mode ownership explicit at Pager/durability boundaries.
+### v0.7.3 replacement policy
 
-### v0.6.3 read overlay
+Implement one readable policy first, preferably LRU or Clock. Eviction candidates require `pin_count == 0`.
 
-Reads must see the newest committed version:
+Dirty eviction must respect the active durability mode rather than bypassing WAL/journal ordering.
 
-```text
-page id
-  ↓
-latest committed WAL frame?
-  ├─ yes -> frame bytes
-  └─ no  -> database file bytes
-```
+### v0.7.4 observability
 
-Keep B+Tree/query layers unaware of whether bytes came from WAL or the database file.
+Expose capacity, resident/pinned/dirty pages, hits, misses, evictions, writebacks and hit ratio. A `.buffer` command would make the mechanism visible.
 
-### v0.6.4 crash recovery
+### v0.7.5 durability interaction
 
-Tests should cover crashes:
+- rollback mode must preserve journal-before-database ordering;
+- WAL mode must never write uncommitted pages into the main DB;
+- committed WAL-backed pages may be evicted because WAL is durable truth;
+- checkpoint should remain independent of residency.
 
-- before commit marker;
-- after committed frames are durable;
-- during/after checkpoint;
-- with multiple committed transactions in WAL;
-- with pages created past the current database EOF.
+### Definition of Done for v0.7
 
-Uncommitted tail frames must not become visible after reopen.
+Tests should prove capacity bounds, pin safety, replacement behavior, dirty writeback correctness in rollback mode, WAL correctness under eviction, query correctness with tiny buffers, inspectable metrics, and green reopen/crash regression on the exact final branch head.
 
-### v0.6.5 checkpoint
+### Explicit non-goals for v0.7
 
-Implement one clear checkpoint mode first. It should copy the newest committed frame for each page to the database file and preserve crash safety.
-
-Expose inspection such as:
-
-```text
-.wal
-.checkpoint
-```
-
-or equivalent Python/debug surfaces.
-
-### v0.6.6 mode boundary
-
-A simple explicit open option is preferable to hidden policy, e.g. rollback-journal by default with an educational WAL mode. Do not implement concurrent writer sophistication yet.
-
-### Definition of Done for v0.6
-
-Tests should prove:
-
-- committed WAL transactions survive reopen;
-- uncommitted/crashed WAL tail is ignored;
-- B+Tree/catalog/index/JOIN behavior is unchanged above Pager;
-- checkpoint preserves logical contents;
-- page creation/root splits survive WAL commit/checkpoint;
-- WAL state is inspectable;
-- exact final branch-head CI passes on the full regression suite.
-
-### Explicit non-goals for v0.6
-
-No multi-writer concurrency, production SQLite WAL binary compatibility, shared-memory `-shm` implementation, sophisticated checkpoint scheduling, snapshot isolation across many simultaneous connections, cost optimizer, or bounded buffer replacement.
+No async I/O, direct-I/O tuning, prefetcher, ARC/2Q sophistication, multi-connection lock manager, cost optimizer, or production-grade memory accounting.
 
 ## 4. Future milestones
-
-### v0.7 — Buffer manager
-
-Bounded cache, pin/unpin, LRU/Clock replacement, eviction/writeback, hit/miss metrics.
 
 ### v0.8 — Cost-based optimizer
 
@@ -254,4 +192,4 @@ advance roadmap
 
 ## 6. Compatibility policy
 
-Before v1.0, Python APIs may evolve between minor versions. Existing page formats should remain readable when practical. Any incompatible byte-layout or durability-protocol change requires `FORMAT_VERSION` review, reopen tests, and an explicit compatibility/migration statement.
+Before v1.0, Python APIs may evolve between minor versions. Existing main database page formats should remain readable when practical. Any incompatible byte-layout or durability-protocol change requires format review, reopen tests, and an explicit compatibility/migration statement.

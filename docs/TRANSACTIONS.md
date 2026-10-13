@@ -128,3 +128,24 @@ This matters for future v0.6 WAL. B+Tree should not be rewritten when the durabi
 - read-only autocommit SELECT does not create a journal
 
 These are deliberate release boundaries.
+
+## v0.6 comparison: WAL mode
+
+v0.2 rollback mode remains supported and remains the default. v0.6 adds an explicit alternative:
+
+```python
+Database("demo.db", journal_mode="wal")
+```
+
+The models differ deliberately:
+
+```text
+rollback journal                     WAL
+----------------                     ---
+before-images                         after-images
+main DB updated before commit         main DB may lag after commit
+journal deletion = commit point       WAL fsync after COMMIT = commit point
+crash => undo                         reopen => overlay committed frames
+```
+
+See `docs/WAL.md` for the v0.6 byte format, recovery rules, and checkpoint ordering.

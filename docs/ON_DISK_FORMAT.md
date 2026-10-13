@@ -117,3 +117,7 @@ An older engine must not write a database after v0.3 indexes exist because it ca
 ## Rollback-journal sidecar
 
 The v0.2 rollback journal remains unchanged. Index pages participate in the same before-image protocol and transaction-created index pages are removed by truncation during rollback/recovery. See `TRANSACTIONS.md`.
+
+## v0.6 WAL sidecar
+
+The main database page bytes are unchanged. WAL mode adds a sidecar file `<database>-wal` with magic `MSQLWAL1`; it stores full-page after-image FRAME records followed by transaction COMMIT records. See `docs/WAL.md` for the exact record layout and checkpoint protocol.
