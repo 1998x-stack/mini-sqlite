@@ -1,52 +1,18 @@
 # mini-sqlite
 
-## v1.1 — Cross-process File Locking
+## v1.2 — Free-list Page Reuse + Incremental VACUUM
 
-v1.1 extends the v0.9 lock state machine to independent Python processes using POSIX `flock` sidecars. Rollback readers/writers, WAL single-writer semantics, checkpoint exclusion, busy timeout, journal-mode agreement, abrupt-process lock release, and VACUUM exclusivity now work across processes. See `docs/CROSS_PROCESS_LOCKING.md` and `examples/cross_process.py`.
+v1.2 adds explicit page ownership/deallocation. Successful REINDEX returns the old index tree to a persistent free-list, later allocations reuse those pages before extending the file, and incremental vacuum truncates only a consecutive free suffix. See `docs/FREELIST.md` and `examples/freelist.py`.
 
 ```text
-LockRegistry (process-local semantics)
-        ↓
-FileLockSet (POSIX flock)
-        ↓
-MODE / PENDING / READERS / WRITER
-        ↓
-Pager + rollback/WAL
+owned page → free_page() → persistent free-list → allocate_page() reuse
+                                             ↓
+                                  free pages at file tail
+                                             ↓
+                                  incremental_vacuum()
 ```
-
 
 A Python-first, SQLite-inspired educational database engine built as a sequence of architectural milestones. It is **not** a wrapper around Python `sqlite3`, and it is **not** SQLite file-format compatible.
-
-## v1.0 — Educationally Complete
-
-The project now forms one inspectable path from SQL text to durable storage and maintenance:
-
-```text
-SQL text
-   ↓
-Tokenizer / Parser / AST
-   ↓
-Cost-Based Planner  ← ANALYZE statistics
-   ↓
-Compiler / Tiny VM
-   ↓
-Relational operators / JOIN
-   ↓
-Table + Secondary-Index B+Trees
-   ↓
-Database connection / Lock Registry
-   ↓
-Pager
-   ↓
-Bounded Buffer Manager (LRU / CLOCK)
-   ↓
-Rollback Journal OR WAL
-   ↓
-Database file
-
-Maintenance / diagnostics observe the whole stack:
-  integrity_check · reindex · vacuum · explain_analyze
-```
 
 ## Version progression
 
@@ -61,7 +27,8 @@ v0.7  Bounded Buffer Manager + LRU/CLOCK
 v0.8  ANALYZE + Cost-Based Optimizer
 v0.9  Multi-Connection Concurrency + Locks
 v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE
-v1.1  Cross-process File Locking                       ← current
+v1.1  Cross-process File Locking
+v1.2  Free-list Page Reuse + Incremental VACUUM         ← current
 ```
 
 ## Quick start
@@ -74,91 +41,27 @@ with Database("demo.db") as db:
     db.execute("INSERT INTO users VALUES (1, 20, 'Alice');")
     db.execute("CREATE INDEX idx_users_age ON users(age);")
     db.execute("ANALYZE users;")
-
     print(db.execute("SELECT * FROM users WHERE age = 20;").rows)
     print(db.explain("SELECT * FROM users WHERE age = 20;"))
     print(db.explain_analyze("SELECT * FROM users WHERE age = 20;").render())
     print(db.integrity_check().render())
 ```
 
-## v1.0 maintenance lifecycle
+## Space lifecycle
 
-### Integrity check
-
-```python
-report = db.integrity_check()
-print(report.ok)
-print(report.render())
-```
-
-The checker validates more than page decodability. It verifies:
-
-- Catalog/table/index B+Tree parent-child structure;
-- separator/key ordering and leaf sibling chains;
-- row record decoding and schema types;
-- INTEGER PRIMARY KEY == stored rowid;
-- secondary-index contents exactly match table rows;
-- page ownership across trees;
-- unreachable/orphan pages;
-- stale ANALYZE statistics as a warning rather than corruption.
-
-### REINDEX
+`REINDEX` now frees the old index tree in the same transaction that publishes the new root. `Pager.allocate_page()` reuses the free-list head before extending the file. `Database.incremental_vacuum(N)` reclaims at most `N` consecutive free pages from the logical tail without moving live pages.
 
 ```python
-db.reindex("idx_users_age")  # one index
-db.reindex()                 # all indexes
+db.reindex("idx_users_age")
+print(db.freelist_text())
+print(db.incremental_vacuum().render())
 ```
 
-A rebuild allocates a new index tree and updates the catalog inside the existing transaction machinery. Failure/ROLLBACK restores the old root and truncates new pages. Old successful index pages become unreachable until VACUUM.
-
-### VACUUM
-
-```python
-result = db.vacuum()
-print(result.render())
-```
-
-VACUUM rebuilds the logical database into a private compact file, recreates indexes/statistics, and atomically replaces the old file. In v1.1 it also requires global OS-level exclusivity so another process cannot keep a live reader snapshot while the inode is replaced.
-
-### EXPLAIN ANALYZE
-
-```python
-print(
-    db.explain_analyze(
-        "SELECT id FROM users WHERE age = 20 ORDER BY id LIMIT 5;"
-    ).render()
-)
-```
-
-It combines:
-
-```text
-estimated plan / candidate costs
-                +
-actual output row count
-actual wall-clock elapsed time
-actual buffer hits / misses / evictions
-                +
-compiled VM bytecode
-```
-
-This is intentionally for teaching, not a stable benchmarking API.
+Integrity checking treats free-list pages as a first-class ownership class, so a page cannot simultaneously belong to a B+Tree and the free-list.
 
 ## Durability modes
 
-Rollback journal:
-
-```python
-Database("demo.db", journal_mode="rollback")
-```
-
-WAL:
-
-```python
-Database("demo.db", journal_mode="wal")
-```
-
-The SQL/Planner/VM/B+Tree stack is shared; only the Pager durability policy differs.
+Rollback journal and WAL share the same SQL/Planner/VM/B+Tree stack. Free-list mutations are ordinary transactional page mutations. Rollback mode journals disappearing tail pages before physical truncate; WAL mode publishes a smaller logical page count and checkpoint performs the physical truncate.
 
 ## Bounded cache and concurrency
 
@@ -167,20 +70,14 @@ Database(
     "demo.db",
     journal_mode="wal",
     buffer_pages=32,
-    replacement_policy="clock",  # or lru
+    replacement_policy="clock",
     busy_timeout_ms=250,
 )
 ```
 
-v1.1 mirrors the process-local lock state machine into POSIX `flock`, so independent Python processes coordinate rollback readers/writers, WAL readers/single-writer, checkpoint, mode agreement, and busy timeout. See `docs/CROSS_PROCESS_LOCKING.md`.
+v1.1 POSIX file locking remains authoritative across processes. Incremental vacuum obtains rollback EXCLUSIVE or WAL checkpoint-level exclusion before physical shrink.
 
 ## CLI
-
-```bash
-mini-sqlite demo.db --buffer-pages 32 --replacement-policy clock
-```
-
-Inspection and maintenance commands:
 
 ```text
 .schema
@@ -200,6 +97,8 @@ Inspection and maintenance commands:
 .integrity
 .reindex [INDEX]
 .vacuum
+.freelist
+.incremental-vacuum [N]
 ```
 
 ## Validate
@@ -218,38 +117,32 @@ python examples/optimizer.py
 python examples/concurrency.py
 python examples/lifecycle.py
 python examples/cross_process.py
+python examples/freelist.py
 python -m compileall -q mini_sqlite
 ```
 
-Optional illustrative microbenchmark:
-
-```bash
-python examples/benchmark.py
-```
-
-It compares only mini-sqlite plans with each other; it is not a benchmark against SQLite.
-
 ## Recommended reading order
 
-Start with [`docs/LEARNING_PATH.md`](docs/LEARNING_PATH.md). For v1.1 locking read:
+For v1.2:
 
-1. `docs/CROSS_PROCESS_LOCKING.md`
-2. `mini_sqlite/concurrency/file_lock.py`
-3. `mini_sqlite/concurrency/lock.py`
-4. `tests/test_cross_process_locking.py`
-5. `examples/cross_process.py`
-
-For lifecycle maintenance read `docs/MAINTENANCE.md`; for persistence/failure semantics see `docs/COMPATIBILITY.md` and `docs/FAULT_MATRIX.md`.
+1. `docs/FREELIST.md`
+2. `docs/ON_DISK_FORMAT.md`
+3. `mini_sqlite/storage/freelist.py`
+4. `mini_sqlite/storage/pager.py`
+5. `mini_sqlite/catalog/catalog.py`
+6. `mini_sqlite/maintenance/database.py`
+7. `tests/test_freelist.py`
+8. `examples/freelist.py`
 
 ## Explicit non-goals
 
 - SQLite binary file-format compatibility;
 - SQL feature parity;
-- Windows cross-process locking in v1.1;
+- Windows cross-process locking;
 - MVCC / multi-writer WAL;
 - savepoints and nested transactions;
 - production-calibrated optimizer costs;
-- online VACUUM or free-list reuse;
+- moving live pages during incremental vacuum or background compaction;
 - production security/performance guarantees.
 
 The goal is a compact engine where the major database mechanisms are visible, testable, and connected.

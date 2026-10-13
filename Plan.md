@@ -13,50 +13,54 @@ v0.7  Bounded Buffer Manager
 v0.8  Cost-Based Optimizer
 v0.9  Process-local Concurrency / Locking
 v1.0  Integrity / REINDEX / VACUUM / Diagnostics
-v1.1  Cross-process File Locking                     ← current
+v1.1  Cross-process File Locking
+v1.2  Free-list Page Reuse + Incremental VACUUM      ← current
 ```
-
-## v1.1 — Cross-process File Locking
-
-Goal: make the v0.9 lock state machine real across independent Python processes without changing storage formats.
-
-Deliverables:
-
-- POSIX `flock` abstraction;
-- MODE agreement/recovery ownership;
-- rollback reader/writer/PENDING protocol;
-- WAL global single writer + concurrent readers;
-- checkpoint global exclusion;
-- busy timeout across processes;
-- crash auto-release and recovery tests;
-- maintenance/VACUUM integration;
-- lock observability and documentation.
 
 ## v1.2 — Free-list Page Reuse + Incremental VACUUM
 
 Dominant question:
 
-> When a B+Tree/index stops owning a page, must the database file grow forever until full VACUUM?
+> When a tree stops owning a page, how can the database reuse or reclaim it without weakening transactions or crash recovery?
+
+Deliverables:
+
+- metadata format v2 with persistent `free_list_head`;
+- `MSQLFREE` page format;
+- transactional `Pager.free_page()`;
+- `allocate_page()` reuses free pages before extending the file;
+- successful REINDEX frees the old index tree;
+- free-list integrity/ownership validation;
+- `.freelist` and `FREE` page inspection;
+- `incremental_vacuum(max_pages)` for consecutive free tail pages;
+- rollback-journal truncation recovery;
+- WAL logical shrink + checkpoint physical truncate;
+- v1-format read/upgrade path;
+- dedicated tests, example, and format documentation.
+
+## v1.3 — Range Index Scan + Composite Index
+
+Dominant question:
+
+> Once indexes are durable and space-managed, how does the planner exploit ordered keys beyond exact equality?
 
 Planned work:
 
-- persistent free-page metadata;
-- page free/reuse API below B+Tree;
-- index rebuild returns old pages to free-list;
-- delete/merge preparation;
-- free-list integrity checks;
-- page allocation prefers reusable pages;
-- incremental vacuum/truncation when free pages reach file tail;
-- crash/rollback/WAL safety for free-list mutation;
-- `.freelist` inspection.
+- lower-bound / upper-bound index cursor;
+- `< <= > >= BETWEEN` index access paths;
+- multi-column index metadata;
+- lexicographic composite key codec;
+- left-prefix matching rules;
+- planner candidate/cost integration;
+- ORDER BY avoidance when index order already satisfies output;
+- explain diagnostics and tests.
 
 ## Later extensions
 
 ```text
-v1.3  Range Index Scan + Composite Index
 v1.4  Savepoints
 v1.5  Hash Join / Merge Join
 v2.0  MVCC experiment
 ```
 
-These are extensions, not prerequisites for the v1.0 educational database core.
+These remain optional extensions beyond the educationally-complete v1.0 core.

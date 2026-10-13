@@ -1,83 +1,37 @@
-# mini-sqlite database on-disk format (v0.1–v0.8)
+# mini-sqlite on-disk format through v1.2
 
-This is an educational format and is **not SQLite-compatible**. All existing table-page and metadata integers are little-endian unless explicitly noted by the index key codec.
+Page size remains 4096 bytes. v1.2 changes only page-0 metadata semantics and adds a free-page header; table/index pages, rows, rollback journal and WAL record layouts are unchanged.
 
-## Database page size
+## Page 0 metadata
 
-`4096` bytes.
+The 24-byte header remains `<8sHHIII>`:
 
-## Page 0: database metadata
+| Offset | Type | Meaning |
+|---:|---|---|
+| 0 | 8 bytes | `MSQLITE1` |
+| 8 | u16 | format version |
+| 10 | u16 | page size |
+| 12 | u32 | catalog root page |
+| 16 | u32 | next table id |
+| 20 | u32 | v1: reserved; v2: `free_list_head` |
 
-| Offset | Size | Field |
-|---:|---:|---|
-| 0 | 8 | magic `MSQLITE1` |
-| 8 | 2 | format version |
-| 10 | 2 | page size |
-| 12 | 4 | catalog root page |
-| 16 | 4 | next table id |
-| 20 | 4 | reserved |
-| 24 | rest | zero/reserved |
+Format v2 uses `0` for an empty free-list. v1.2 can decode v1 and upgrades metadata in memory; once new metadata/free-list semantics are persisted, page 0 is written as format 2. Older v1.1 engines reject format 2.
 
-## Common slotted-page header
+## Free page
 
-Table B+Tree and secondary-index B+Tree pages share this 32-byte header with node type, flags, cell count, parent, right sibling, first child, free-start, content-start, reserved bytes, then a cell-pointer array.
-
-Node types:
+A free page starts with:
 
 ```text
-1 TABLE/CATALOG LEAF
-2 TABLE/CATALOG INTERNAL
-3 SECONDARY INDEX LEAF
-4 SECONDARY INDEX INTERNAL
+0x00  8 bytes  MSQLFREE
+0x08  u32      next free page id
+0x0c  20 bytes reserved zero
+0x20  ...      zero-filled remainder
 ```
 
-Table/catalog leaf cells use `i64 key + u32 value length + value bytes`; internal cells use `i64 separator key + u32 right child`.
+Page 0 can never be free. `next_page=0` terminates the singly linked list.
 
-Secondary-index leaf cells use `u16 key length + u32 value length + key bytes + value bytes`; internal cells use `u16 key length + u32 right child + key bytes`.
+## Transaction compatibility
 
-Logical secondary-index keys are `KeyCodec.encode_value(indexed_value) + KeyCodec.encode_rowid(rowid)`.
+Rollback-journal bytes are unchanged. During incremental vacuum every disappearing free tail page is journaled before physical truncate so hot-journal recovery can reconstruct the original file length.
 
-## Record value
-
-```text
-u16 column_count
-repeated column_count times:
-    u8  type_tag
-    u32 payload_length
-concatenated payload bytes
-```
-
-Integer payload is signed 64-bit little-endian. Text payload is UTF-8.
-
-## Catalog schema extension in v0.3
-
-`TableSchema` JSON adds optional index metadata. v0.3 accepts older catalog records where `indexes` is absent. Existing v0.1/v0.2 table B+Tree byte layouts are unchanged.
-
-## Rollback journal and WAL
-
-The v0.2 rollback journal stores before-images. The v0.6 `<database>-wal` sidecar stores full-page after-image FRAME records followed by transaction COMMIT records. v0.7 changes only in-memory residency, not either file format.
-
-## v0.8 optimizer metadata
-
-The 4 KiB page format, table B+Tree cells, index B+Tree cells, rollback-journal format and WAL format are unchanged.
-
-Catalog table-schema JSON may now contain an optional `stats` object:
-
-```json
-{
-  "stats": {
-    "row_count": 100,
-    "columns": {
-      "grp": {
-        "null_count": 0,
-        "distinct_count": 11,
-        "min_value": 1,
-        "max_value": 100,
-        "most_common": [[1, 90], [91, 1]]
-      }
-    }
-  }
-}
-```
-
-Missing `stats` means "not analyzed". Older schema JSON without this field remains readable. Because statistics live inside ordinary catalog B+Tree values, they inherit the existing rollback/WAL durability protocol.
+WAL bytes are unchanged. The existing COMMIT logical `page_count` field carries shrink semantics: v1.2 may commit a smaller logical page count, and checkpoint later truncates the main file accordingly.

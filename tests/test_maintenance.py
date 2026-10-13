@@ -33,9 +33,7 @@ def test_integrity_check_healthy_database(tmp_path: Path) -> None:
         assert report.render().startswith("ok\n")
 
 
-def test_integrity_check_detects_secondary_index_mismatch_and_reindex_repairs_it(
-    tmp_path: Path,
-) -> None:
+def test_integrity_check_detects_secondary_index_mismatch_and_reindex_repairs_it(tmp_path: Path) -> None:
     path = tmp_path / "repair.db"
     with Database(path) as db:
         make_users(db, 24)
@@ -44,11 +42,9 @@ def test_integrity_check_detects_secondary_index_mismatch_and_reindex_repairs_it
         row = RecordCodec.decode(BTree(db.pager, table.root_page).get_required(3))
         assert index.delete(row, 3)
         db.flush()
-
         broken = db.integrity_check()
         assert not broken.ok
         assert any("contents disagree" in error for error in broken.errors)
-
         assert db.reindex("idx_users_age") == 1
         repaired = db.integrity_check()
         assert repaired.ok
@@ -62,14 +58,12 @@ def test_reindex_all_is_atomic_and_rollback_restores_old_roots(tmp_path: Path) -
         db.execute("CREATE INDEX idx_users_name ON users(name);")
         before = {index.name: index.root_page for _table, index in db.catalog.list_indexes()}
         before_pages = db.pager.page_count
-
         db.begin()
         assert db.reindex() == 2
         during = {index.name: index.root_page for _table, index in db.catalog.list_indexes()}
         assert during != before
         assert db.pager.page_count > before_pages
         db.rollback()
-
         after = {index.name: index.root_page for _table, index in db.catalog.list_indexes()}
         assert after == before
         assert db.pager.page_count == before_pages
@@ -85,14 +79,12 @@ def test_integrity_warns_for_stale_statistics_and_orphan_pages(tmp_path: Path) -
         db.execute("INSERT INTO users VALUES (101, 3, 'late');")
         report = db.integrity_check()
         assert report.ok
-        assert report.orphan_pages
-        assert any("unreachable page" in warning for warning in report.warnings)
+        assert report.free_pages > 0
+        assert report.orphan_pages == ()
         assert any("statistics" in warning and "stale" in warning for warning in report.warnings)
 
 
-def test_vacuum_reclaims_unreachable_pages_and_preserves_schema_data_indexes_stats(
-    tmp_path: Path,
-) -> None:
+def test_vacuum_reclaims_unreachable_pages_and_preserves_schema_data_indexes_stats(tmp_path: Path) -> None:
     path = tmp_path / "vacuum.db"
     with Database(path, buffer_pages=4) as db:
         make_users(db, 260)
@@ -102,10 +94,10 @@ def test_vacuum_reclaims_unreachable_pages_and_preserves_schema_data_indexes_sta
         db.reindex("idx_users_age")
         before_report = db.integrity_check()
         assert before_report.ok
-        assert before_report.orphan_pages
+        assert before_report.free_pages > 0
+        assert not before_report.orphan_pages
         before_pages = db.pager.page_count
         rows_before = db.execute("SELECT id, age, name FROM users ORDER BY id;").rows
-
         result = db.vacuum()
         assert result.before_pages == before_pages
         assert result.after_pages < result.before_pages
@@ -116,13 +108,12 @@ def test_vacuum_reclaims_unreachable_pages_and_preserves_schema_data_indexes_sta
         assert report.ok
         assert report.orphan_pages == ()
         assert db.catalog.get_table("users").stats is not None
-
     with Database(path) as reopened:
         assert reopened.integrity_check().ok
         assert reopened.execute("SELECT COUNT(*) FROM users;").rows == [(40,)]
 
 
-def test_vacumm_wal_checkpoint_and_mode_reopen(tmp_path: Path) -> None:
+def test_vacuum_wal_checkpoint_and_mode_reopen(tmp_path: Path) -> None:
     path = tmp_path / "vacuum-wal.db"
     with Database(path, journal_mode="wal", buffer_pages=4) as db:
         make_users(db, 90)
@@ -130,11 +121,8 @@ def test_vacumm_wal_checkpoint_and_mode_reopen(tmp_path: Path) -> None:
         assert db.pager.wal_stats()["committed_frames"] > 0
         result = db.vacuum()
         assert result.after_pages > 0
-        assert db.execute("SELECT name FROM users WHERE id = 91;").rows == [
-            ("wal-only-before-vacuum",)
-        ]
+        assert db.execute("SELECT name FROM users WHERE id = 91;").rows == [("wal-only-before-vacuum",)]
         assert db.integrity_check().ok
-
     with Database(path, journal_mode="wal") as reopened:
         assert reopened.execute("SELECT id FROM users WHERE id = 91;").rows == [(91,)]
         assert reopened.integrity_check().ok

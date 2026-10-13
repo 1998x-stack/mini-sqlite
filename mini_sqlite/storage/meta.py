@@ -15,6 +15,7 @@ class DatabaseMeta:
     catalog_root_page: int = 1
     next_table_id: int = 1
     version: int = FORMAT_VERSION
+    free_list_head: int = 0
 
     def encode(self) -> bytes:
         page = bytearray(self.page_size)
@@ -26,7 +27,7 @@ class DatabaseMeta:
             self.page_size,
             self.catalog_root_page,
             self.next_table_id,
-            0,
+            self.free_list_head,
         )
         return bytes(page)
 
@@ -34,10 +35,10 @@ class DatabaseMeta:
     def decode(cls, page: bytes | bytearray) -> "DatabaseMeta":
         if len(page) < _META.size:
             raise CorruptionError("meta page too small")
-        magic, version, page_size, catalog_root, next_table_id, _ = _META.unpack_from(page, 0)
+        magic, version, page_size, catalog_root, next_table_id, free_list_head = _META.unpack_from(page, 0)
         if magic != DB_MAGIC:
             raise CorruptionError(f"bad database magic: {magic!r}")
-        if version != FORMAT_VERSION:
+        if version not in {1, FORMAT_VERSION}:
             raise CorruptionError(f"unsupported format version {version}")
         if page_size != len(page):
             raise CorruptionError(
@@ -48,4 +49,5 @@ class DatabaseMeta:
             catalog_root_page=catalog_root,
             next_table_id=next_table_id,
             version=version,
+            free_list_head=free_list_head,
         )

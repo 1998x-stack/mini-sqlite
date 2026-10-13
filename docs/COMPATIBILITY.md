@@ -1,44 +1,12 @@
-# Compatibility and Format Boundaries
+# Compatibility through v1.2
 
-mini-sqlite is not SQLite file-format compatible. Compatibility here means **between mini-sqlite milestones**.
+v1.2 is the first mini-sqlite release to bump the main database metadata version from 1 to 2.
 
-## Stable main-file format
+- v1.2 reads format-v1 databases.
+- New databases use format 2.
+- A v1 database is upgraded in memory on open and becomes format 2 when metadata/free-list state is next persisted.
+- v1.1 and earlier reject format 2 rather than silently clearing the free-list pointer.
 
-The main database format introduced in v0.1 remains the base through v1.0:
+Unchanged binary layouts: 4 KiB pages, table/catalog B+Tree nodes, secondary-index nodes, row records, rollback journal, WAL and v1.1 POSIX lock sidecars.
 
-- 4 KiB fixed pages;
-- page 0 metadata;
-- integer-key table/catalog B+Trees;
-- typed self-describing row records.
-
-v0.3 adds secondary-index page node types and catalog JSON fields. Older catalog JSON without `indexes` remains readable by later versions.
-
-v0.8 adds optional statistics fields to catalog JSON. Missing statistics remain valid and trigger rule-based fallback planning.
-
-## Durability sidecars
-
-### Rollback journal
-
-v0.2 format remains unchanged through v1.0. v0.9 changed **when** a journal is created (lazy first write), not its bytes.
-
-### WAL
-
-v0.6 WAL frame/commit format remains unchanged through v1.0.
-
-## Buffer/concurrency/optimizer
-
-v0.7 buffer management, v0.8 optimizer, and v0.9 process-local locking do not change database page bytes.
-
-## v1.0 maintenance
-
-`integrity_check` is read-only.
-
-`REINDEX` creates new index pages and changes catalog root references, but no byte layout changes.
-
-`VACUUM` rewrites a semantically equivalent database. Physical page ids/root ids may differ, which is expected. Logical tables, rows, index definitions, and statistics presence are preserved.
-
-## Unsupported compatibility claims
-
-- SQLite `.db` files cannot be opened by mini-sqlite;
-- mini-sqlite files cannot be opened by SQLite;
-- separate mini-sqlite major/minor versions are not promised to perform migrations for future incompatible formats unless a later milestone explicitly implements them.
+The new format-v2 field is page-0 offset 20: `free_list_head`. Free pages use the `MSQLFREE` header documented in `ON_DISK_FORMAT.md`.

@@ -1,86 +1,70 @@
-# Current integrated state — v1.1
+# mini-sqlite v1.2.0 — Free-list Page Reuse + Incremental VACUUM
 
-`main` contains the validated **v1.1 Cross-process File Locking** engine tree on top of the v1.0 educational core.
+## Status
 
-## Integrated architecture
+**Implemented / frozen candidate.**
+
+v1.2 closes the fixed-page storage lifecycle: pages can now be explicitly released, persisted on a free-list, reused by later allocations, and physically truncated when free pages reach the file tail.
+
+## Main mental model
 
 ```text
-SQL → Parser / AST → Cost-Based Planner → Compiler / VM
-                           ↑                    │
-                    ANALYZE statistics         ↓
-                                    relational ops / JOIN
-                                             ↓
-                                  table/index B+Trees
-                                             ↓
-                                     Database connection
-                                      │              │
-                                      ↓              ↓
-                                LockRegistry     FileLockSet
-                                 local state     POSIX flock
-                                      │              │
-                                      └──────┬───────┘
-                                             ↓
-                                           Pager
-                                             ↓
-                                  Bounded Buffer Manager
-                                             ↓
-                          rollback journal OR WAL/checkpoint
-                                             ↓
-                                        database file
+owned page
+   ↓
+free_page()
+   ↓
+persistent free-list
+   ↓
+allocate_page()
+   ├─ reuse
+   └─ extend file
 
-Lifecycle diagnostics / maintenance:
- integrity_check · reindex · vacuum · explain_analyze
+free tail suffix
+   ↓
+incremental_vacuum()
+   ↓
+physical space reclaimed
 ```
 
-## v1.1 additions
+## New capabilities
 
-- cross-process POSIX `flock` backend on macOS/Linux;
-- persistent MODE / PENDING / READERS / WRITER sidecars whose existence is not liveness;
-- globally-first MODE-EX recovery/bootstrap ownership;
-- live rollback/WAL mode agreement across interpreters;
-- rollback SHARED / RESERVED / EXCLUSIVE semantics across processes;
-- PENDING turnstile preventing reader starvation of writers;
-- WAL concurrent readers + one global writer;
-- checkpoint exclusion across processes;
-- cross-process `busy_timeout_ms`;
-- constructor guard preventing rollback Pager open during EX writer;
-- kernel auto-release after abrupt process death;
-- hot-journal recovery after `os._exit()`;
-- VACUUM global exclusion;
-- lock observability showing process-local and OS lock state.
-
-## Validation
-
-The frozen `v1.1` branch passed the exact GitHub CI matrix on Python 3.10 and 3.12, including the complete regression suite, lifecycle smoke, cross-process smoke, and compile check.
-
-```bash
-python -m pytest -q
-python examples/cross_process.py
-python -m compileall -q mini_sqlite
-```
+- database metadata format v2;
+- page-0 `free_list_head`;
+- `MSQLFREE` linked free-page format;
+- transactional page deallocation;
+- allocation prefers free pages;
+- REINDEX returns old index-tree pages to the free-list;
+- integrity checker validates free-list structure and ownership;
+- `.freelist` and `FREE` page display;
+- incremental tail-page vacuum with optional limit;
+- rollback-journal crash-safe truncation;
+- WAL logical page-count shrink + checkpoint truncate;
+- read/upgrade path for format-v1 databases.
 
 ## Compatibility
 
-v1.1 changes no database-page, record, catalog, rollback-journal, WAL, or index byte format. v1.0 database files reopen directly.
+v1.2 reads format-v1 mini-sqlite databases. New databases use format 2. An opened v1 database is upgraded in memory and is persisted as format 2 when metadata/free-list semantics are next written.
 
-The cross-process backend is POSIX-only in v1.1; Windows support is intentionally deferred rather than simulated incorrectly.
+Unchanged:
 
-## Next — v1.2
+- 4 KiB page size;
+- table/catalog B+Tree page layout;
+- secondary-index B+Tree page layout;
+- row record encoding;
+- rollback-journal format;
+- WAL format;
+- v1.1 lock sidecars.
 
-**Free-list Page Reuse + Incremental VACUUM**
+## Validation target
 
-Planned direction:
+- all v0.1–v1.1 regression tests;
+- dedicated free-list/reuse/incremental-vacuum tests;
+- rollback and WAL crash/reopen cases;
+- format-v1 upgrade case;
+- free-list smoke example;
+- Python 3.10 / 3.12 exact branch-head CI;
+- `compileall`.
 
-```text
-page becomes unreachable
-        ↓
-persistent free-list
-        ↓
-future allocation reuses page
-        ↓
-free pages reach file tail
-        ↓
-incremental truncation
-```
+## Next
 
-The key invariant is that free-list mutation must obey the same rollback/WAL crash-safety and v1.1 locking rules as ordinary page ownership changes.
+**v1.3 — Range Index Scan + Composite Index**: turn the secondary-index layer from equality-only lookup into ordered-range access and multi-column keys, then expose those choices to the cost-based planner.

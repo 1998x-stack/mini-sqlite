@@ -1,148 +1,119 @@
-# Agents.md — mini-sqlite Development Contract
+# Agents.md — mini-sqlite v1.2 Development Contract
 
-> **Mandatory for future work:** read this file before changing code, tests, documentation, branches, storage formats, durability, planning, concurrency, locking, or maintenance semantics.
->
-> `main` is the canonical integrated state. Historical version branches are frozen learning snapshots.
+> Frozen learning snapshot. Read this file before changing page allocation, free-list metadata, truncation, durability, integrity, tests, or documentation.
 
-## 1. Repository mission
+## 1. Version mission
 
-mini-sqlite is a Python-first educational database engine for understanding SQLite-style database mechanisms through small, inspectable milestones.
+v1.2 adds one dominant mental model:
 
-Priorities:
+> **A page has an owner lifecycle: owned → free → reused or physically reclaimed.**
 
-```text
-architectural clarity
-      ↓
-correctness + explicit invariants
-      ↓
-readable reference implementation
-      ↓
-mechanism-focused tests
-      ↓
-observable end-to-end behavior
-```
+The existing SQL, optimizer, locking, rollback-journal, WAL, and buffer-pool layers remain. v1.2 introduces explicit page deallocation and space reuse below B+Trees.
 
-## 2. Integrated architecture through v1.1
+## 2. Mandatory reading order
 
-```text
-SQL / Parser / AST
-        ↓
-Cost-Based Planner ← ANALYZE statistics
-        ↓
-Compiler / Tiny VM
-        ↓
-Relational operators / JOIN
-        ↓
-Table + Secondary-Index B+Trees
-        ↓
-Database connection
-        ↓
-LockRegistry ─→ POSIX FileLockSet
-        │          MODE / PENDING / READERS / WRITER
-        ↓
-Pager
-        ↓
-Bounded Buffer Manager (LRU / CLOCK)
-        ↓
-Rollback Journal OR WAL
-        ↓
-Database file
+1. `Agents.md`
+2. `version.md`
+3. `docs/FREELIST.md`
+4. `docs/ON_DISK_FORMAT.md`
+5. `mini_sqlite/storage/freelist.py`
+6. `mini_sqlite/storage/pager.py`
+7. `mini_sqlite/catalog/catalog.py`
+8. `mini_sqlite/maintenance/database.py`
+9. `mini_sqlite/maintenance/integrity.py`
+10. `tests/test_freelist.py`
+11. `examples/freelist.py`
+12. `docs/TRANSACTIONS.md` and `docs/WAL.md`
 
-Lifecycle layer:
- integrity_check · reindex · vacuum · explain_analyze
-```
+## 3. Branch boundary
 
-## 3. Version spine
+This branch is the frozen **v1.2 free-list + incremental-vacuum milestone**.
+
+Do not backport v1.3 range/composite indexes, savepoints, hash/merge join, or MVCC.
+
+## 4. Layering invariant
 
 ```text
-v0.1  Page/Pager/B+Tree + SQL/Planner/VM
-v0.2  Rollback Journal + Transactions + Crash Recovery
-v0.3  Secondary Index
-v0.4  Relational Execution + UPDATE
-v0.5  INNER JOIN + Indexed Nested Loop
-v0.6  WAL + Read Overlay + Checkpoint
-v0.7  Bounded Buffer Manager + LRU/CLOCK
-v0.8  ANALYZE + Cost-Based Optimizer
-v0.9  Process-local Multi-Connection Concurrency
-v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE
-v1.1  Cross-process POSIX File Locking                         ✅ integrated
-v1.2  Free-list Page Reuse + Incremental VACUUM               ← next
+Catalog / future tree maintenance
+        │ page no longer owned
+        ▼
+Pager.free_page()
+        ↓
+persistent singly-linked free-list
+        ↓
+Pager.allocate_page()
+        ├─ reuse free head
+        └─ extend file
+        ↓
+rollback journal OR WAL
+
+free tail pages
+        ↓
+Pager.trim_free_tail()
+        ↓
+Database.incremental_vacuum()
 ```
 
-## 4. Branch invariant
+B+Trees and indexes must not parse free-page bytes. Pager owns allocation/deallocation. Page 0 owns the persistent head pointer via a callback injected by Database.
 
-```text
-validated main
-   ↓
-create vX.Y
-   ↓
-implement one dominant mental model
-   ↓
-tests + docs + example
-   ↓
-exact version branch-head CI green
-   ↓
-freeze version branch
-   ↓
-integrate the same validated engine tree into main
-   ↓
-restore canonical main Agents.md / version.md
-```
+## 5. Free-list invariants
 
-Never claim a version is frozen from local tests alone.
+- page 0 is never free;
+- every free page starts with `MSQLFREE` and stores exactly one next-page pointer;
+- `0` terminates the chain;
+- no free-list cycles;
+- every free-list page id is `< logical page_count`;
+- a page cannot simultaneously belong to a tree and the free-list;
+- allocation prefers the free-list head before extending the file;
+- reusing/freeing a page requires an active transaction;
+- rollback restores both page bytes and the original free-list head;
+- WAL publishes free-list changes only at COMMIT;
+- valid free pages are not integrity-check orphans.
 
-## 5. Core invariants
+## 6. Incremental-vacuum invariants
 
-- SQL frontend never accesses page bytes directly.
-- Planner performs no physical I/O.
-- VM talks to cursors/storage abstractions, not OS files.
-- B+Trees mutate pages only through Pager.
-- Pager owns durability ordering; Buffer Manager owns residency.
-- rollback before-images become durable before unsafe DB-page writeback.
-- uncommitted WAL dirty frames never leak into the main database.
-- WAL readers observe complete committed prefixes only.
-- process-local lock state remains readable in `LockRegistry`.
-- cross-process truth comes from kernel locks, never lock-file existence.
-- MODE owns live journal-mode agreement and globally-first recovery ownership.
-- PENDING prevents new rollback readers from starving an EXCLUSIVE writer.
-- process death must release OS locks without cleanup code.
-- storage formats are independent of lock-sidecar metadata.
-- integrity checking is read-only; REINDEX/VACUUM use normal engine paths.
+- only consecutive free pages at the logical file tail may be truncated;
+- live pages are never moved;
+- `max_pages` limits one invocation without changing correctness;
+- rollback mode journals every tail free page that may physically disappear before deleting the journal;
+- WAL mode commits a smaller logical page count, then checkpoint performs physical truncation;
+- WAL incremental vacuum obtains checkpoint-level exclusion so old readers cannot race physical shrink;
+- failure before commit leaves the original logical page count visible.
 
-## 6. Compatibility rule
+## 7. Format invariant
 
-Any incompatible page, record, catalog, rollback-journal, WAL, index, or future free-list byte-layout change requires an explicit version, exact format documentation, reopen/corruption/crash tests, and a compatibility statement.
+v1.2 promotes the database metadata format from **1 → 2**.
 
-v1.1 changes no database, journal, or WAL byte format.
+Page 0 keeps the same 24-byte structure, but the final `u32` is now `free_list_head` instead of reserved. v1.2 reads format 1 and upgrades in memory; the first metadata/free-list persistence writes format 2. Older v1.1 engines must reject v2 instead of silently destroying space metadata.
 
-## 7. Validation contract
+Table/catalog/index page bytes, row records, rollback-journal bytes, and WAL bytes are unchanged.
+
+## 8. Cross-process invariant
+
+v1.1 POSIX locking remains authoritative. Incremental vacuum requires rollback EXCLUSIVE or WAL checkpoint-level exclusion. Free-list mutation itself does not introduce new lock files.
+
+## 9. Testing contract
+
+Run:
 
 ```bash
 python -m pytest -q
-python examples/quickstart.py
-python examples/transactions.py
-python examples/indexes.py
-python examples/relational.py
-python examples/joins.py
-python examples/wal.py
-python examples/buffer_pool.py
-python examples/optimizer.py
-python examples/concurrency.py
-python examples/lifecycle.py
+python examples/freelist.py
 python examples/cross_process.py
 python -m compileall -q mini_sqlite
 ```
 
-For cross-process behavior, use multiprocessing `spawn` or separate interpreters; `fork` alone does not prove independent lock registries.
+Changes to free-list/truncation logic must include rollback, WAL, reopen, corruption, page-reuse, and crash-window tests.
 
-## 8. Platform boundary
+## 10. Definition of done
 
-The v1.1 cross-process backend is POSIX `flock` for macOS/Linux. A Windows backend must implement the same abstraction rather than leaking platform-specific calls upward.
+A v1.2 change is complete only when:
 
-## 9. Next milestone: v1.2
-
-The next dominant question is page lifecycle:
-
-> When an index/table stops owning a page, must that page remain orphaned until full VACUUM?
-
-v1.2 should introduce persistent free-page metadata, safe page reuse, integrity checks, transaction/WAL-safe free-list mutation, and incremental tail truncation without weakening v1.1 locking or prior durability invariants.
+1. reachable pages, free pages, and orphan pages are disjoint;
+2. page reuse does not increase file size unnecessarily;
+3. rollback/WAL restore or publish ownership atomically;
+4. incremental vacuum never truncates a live page;
+5. crash recovery restores a file truncated before rollback-journal deletion;
+6. format-v1 databases still open and can upgrade deliberately;
+7. exact branch-head CI is green on supported Python versions;
+8. docs match the actual on-disk and transaction ordering.

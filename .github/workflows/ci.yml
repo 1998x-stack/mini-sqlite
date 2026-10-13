@@ -41,5 +41,7 @@ jobs:
         run: python examples/lifecycle.py
       - name: Smoke cross-process locking
         run: python examples/cross_process.py
+      - name: Smoke free-list reuse
+        run: python examples/freelist.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite
