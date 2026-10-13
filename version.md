@@ -1,66 +1,65 @@
-# mini-sqlite v0.5
+# Current integrated state — v0.5
 
-## Theme
+`main` currently contains the validated **v0.5 INNER JOIN + indexed nested-loop** implementation on top of the v0.1 page/B+Tree/SQL/VM, v0.2 rollback-journal transaction, v0.3 secondary-index, and v0.4 relational-execution foundations.
 
-**Two-source relational execution through visible JOIN algorithms.**
-
-v0.5 keeps v0.4's post-source relational pipeline and adds an explicit second row source:
+## Integrated architecture
 
 ```text
-outer source
-    ↓
-inner scan / PK seek / secondary-index seek
-    ↓
-INNER JOIN
-    ↓
-filter -> sort -> aggregate/project -> limit -> emit
+SQL → AST → Planner
+          │
+          ├─ single source: PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN
+          ├─ JOIN inner:    PK seek / index seek / table scan
+          └─ filter / sort / aggregate-project / limit metadata
+                               ↓
+                         Compiler → VM
+                               ↓
+outer source → inner lookup/scan → JOIN
+                               ↓
+filter → sort → aggregate/project → limit → emit
+                               ↓
+                 table/index B+Trees → Pager
+                                      ├─ rollback journal
+                                      └─ database file
 ```
 
-## Delta from v0.4
+## Current capabilities
 
-Added:
-
-- `JOIN` / `INNER JOIN`;
-- one INNER JOIN per SELECT;
-- table aliases with and without `AS`;
-- qualified column names;
-- unqualified-column ambiguity checks;
+- persistent 4 KiB page file;
+- slotted table/catalog B+Tree and secondary-index B+Tree;
+- tokenizer/parser/AST/planner/tiny VM;
+- explicit/autocommit rollback-journal transactions and hot-journal recovery;
+- `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `DELETE`, `UPDATE`;
+- primary-key equality lookup, secondary-index equality lookup, table scan;
+- predicates `= != < <= > >=`;
+- `ORDER BY ... ASC/DESC`, `LIMIT`, scalar `COUNT/SUM/MIN/MAX`;
+- transactional maintenance of every secondary index during writes;
+- `JOIN` / `INNER JOIN` for one two-table join per SELECT;
+- table aliases and qualified column references;
+- ambiguity detection for unqualified names;
 - self-join with distinct aliases;
 - plain nested-loop join;
 - primary-key indexed nested-loop join;
-- secondary-index indexed nested-loop join;
-- join-aware projection/filter/order/aggregate resolution;
-- explicit VM instructions `SEEK_PK_FROM_COLUMN`, `SEEK_INDEX_FROM_COLUMN`, `FILTER_JOIN_EQ`, `COLLECT_JOIN_ROW`, `FILTER_ROWS`;
-- `docs/JOINS.md`, `examples/joins.py`, and `tests/test_joins.py`.
+- secondary-index indexed nested-loop join with duplicate inner matches;
+- explicit JOIN opcodes `SEEK_PK_FROM_COLUMN`, `SEEK_INDEX_FROM_COLUMN`, `FILTER_JOIN_EQ`, `COLLECT_JOIN_ROW`;
+- JOIN rows reuse v0.4 filter/sort/aggregate/project/limit stages;
+- schema/page/tree/index/plan/bytecode/transaction inspection commands.
 
-## Important source files
+## Recommended reading order for the latest mechanism
 
-- `mini_sqlite/sql/ast.py`
-- `mini_sqlite/sql/tokens.py`
-- `mini_sqlite/sql/tokenizer.py`
-- `mini_sqlite/sql/parser.py`
-- `mini_sqlite/planner/plan.py`
-- `mini_sqlite/planner/planner.py`
-- `mini_sqlite/vm/opcode.py`
-- `mini_sqlite/vm/compiler.py`
-- `mini_sqlite/vm/vm.py`
-- `tests/test_joins.py`
-- `docs/JOINS.md`
-
-## Recommended reading order
-
-1. v0.4 relational pipeline
-2. `docs/JOINS.md`
-3. `sql/ast.py`
-4. `sql/parser.py`
-5. `planner/plan.py`
-6. `planner/planner.py`
-7. `vm/compiler.py`
-8. `vm/vm.py`
+1. `docs/JOINS.md`
+2. `mini_sqlite/sql/ast.py`
+3. `mini_sqlite/sql/parser.py`
+4. `mini_sqlite/planner/plan.py`
+5. `mini_sqlite/planner/planner.py`
+6. `mini_sqlite/vm/compiler.py`
+7. `mini_sqlite/vm/opcode.py`
+8. `mini_sqlite/vm/vm.py`
 9. `tests/test_joins.py`
 10. `examples/joins.py`
 
-## Validation
+For earlier mechanisms, read `docs/TRANSACTIONS.md`, `docs/INDEXES.md`, and `docs/RELATIONAL_ENGINE.md`.
+
+## Validation commands
 
 ```bash
 python -m pytest -q
@@ -74,12 +73,8 @@ python -m compileall -q mini_sqlite
 
 ## Storage compatibility
 
-v0.5 introduces **no on-disk format change**. The database page format, catalog encoding, rollback journal, table B+Tree, and secondary-index B+Tree remain v0.4-compatible.
-
-## Explicit non-goals
-
-No outer joins, multiple join chains, arbitrary ON expressions, hash/merge joins, join reordering, cost model, GROUP BY/HAVING, subqueries, range index scans, WAL, or concurrency.
+v0.5 introduces no on-disk format change. Existing database pages, catalog metadata, secondary-index pages, and rollback journal remain v0.4-compatible.
 
 ## Next
 
-v0.6 should add **WAL** so the project can contrast rollback-journal durability with append-only logging and checkpointing.
+See `Plan.md`: **v0.6 WAL** — an educational after-image write-ahead log, committed-frame read overlay, crash recovery, inspection, and checkpointing below the unchanged B+Tree/query layers.
