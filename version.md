@@ -1,63 +1,64 @@
-# mini-sqlite v1.0.0 — Educationally Complete
+# Current integrated state — v1.0
 
-v1.0 closes the core learning loop built from v0.1 through v0.9. It adds integrity checking, index repair, physical compaction, and estimated-vs-actual execution diagnostics without changing existing database file/journal/WAL formats.
+`main` contains the validated **v1.0 Educationally Complete** mini-sqlite core.
 
-## Primary mental model
-
-```text
-build structures
-      ↓
-execute queries
-      ↓
-make them durable
-      ↓
-coordinate connections
-      ↓
-inspect correctness
-      ↓
-repair derived indexes
-      ↓
-compact unreachable pages
-```
-
-## New capabilities
-
-- `Database.integrity_check()` / `.integrity`;
-- structural validation for catalog/table/index B+Trees;
-- table-row and secondary-index cross-checking;
-- stale statistics + orphan page diagnostics;
-- `Database.reindex()` / `.reindex [INDEX]`;
-- transaction-safe index rebuild;
-- `Database.vacuum()` / `.vacuum`;
-- compact logical rewrite + atomic same-filesystem replace;
-- WAL checkpoint before WAL-mode rewrite;
-- `Database.explain_analyze()` / `.explain-analyze SQL`;
-- estimated plan + actual rows/time/buffer deltas + bytecode;
-- final learning path, compatibility matrix, fault matrix, and lifecycle example;
-- optional plan/cache microbenchmark.
-
-## Compatibility
-
-No on-disk binary format changes from v0.9. VACUUM may assign different physical page ids because it rebuilds B+Trees, but logical schema/data/index definitions are preserved.
-
-## Important files
+## Integrated architecture
 
 ```text
-mini_sqlite/maintenance/integrity.py
-mini_sqlite/maintenance/diagnostics.py
-mini_sqlite/database.py
-mini_sqlite/catalog/catalog.py
-mini_sqlite/cli/shell.py
+SQL → Parser / AST → Cost-Based Planner → Compiler / VM
+                           ↑                    │
+                    ANALYZE statistics         ↓
+                                    relational ops / JOIN
+                                             ↓
+                                  table/index B+Trees
+                                             ↓
+                              Database / Lock Registry
+                                             ↓
+                                           Pager
+                                             ↓
+                                  Bounded Buffer Manager
+                                  ├─ LRU
+                                  └─ CLOCK
+                                             ↓
+                          rollback journal OR WAL/checkpoint
+                                             ↓
+                                        database file
 
-tests/test_maintenance.py
-examples/lifecycle.py
-examples/benchmark.py
-
-docs/MAINTENANCE.md
-docs/LEARNING_PATH.md
-docs/COMPATIBILITY.md
-docs/FAULT_MATRIX.md
+Lifecycle diagnostics / maintenance:
+ integrity_check · reindex · vacuum · explain_analyze
 ```
+
+## Core capabilities
+
+- persistent 4 KiB page file and slotted B+Trees;
+- SQL tokenizer/parser/AST/planner/tiny VM;
+- CREATE TABLE/INDEX, INSERT/SELECT/DELETE/UPDATE;
+- comparisons, ORDER BY, LIMIT and scalar aggregates;
+- INNER JOIN, aliases, self-join, indexed nested loop;
+- rollback-journal transactions and crash recovery;
+- secondary indexes with atomic table/index maintenance;
+- WAL after-image frames, committed overlay and checkpoint;
+- bounded LRU/CLOCK buffer pool with pin/unpin and dirty eviction rules;
+- ANALYZE statistics, selectivity estimates and cost-based scan/index/JOIN choices;
+- process-local multi-connection locking, busy timeout and WAL reader snapshots;
+- integrity checking across page trees, table rows and secondary indexes;
+- transaction-safe REINDEX;
+- exclusive compact VACUUM rewrite;
+- EXPLAIN ANALYZE with estimated plan, actual rows/time, buffer deltas and VM bytecode;
+- architecture/compatibility/fault/learning-path documentation.
+
+## Recommended v1.0 reading path
+
+1. `docs/LEARNING_PATH.md`
+2. `docs/MAINTENANCE.md`
+3. `mini_sqlite/maintenance/database.py`
+4. `mini_sqlite/maintenance/integrity.py`
+5. `tests/test_maintenance.py`
+6. `examples/lifecycle.py`
+7. `docs/COMPATIBILITY.md`
+8. `docs/FAULT_MATRIX.md`
+
+For earlier mechanisms follow the version-by-version paths in `docs/LEARNING_PATH.md`.
 
 ## Validation
 
@@ -76,6 +77,19 @@ python examples/lifecycle.py
 python -m compileall -q mini_sqlite
 ```
 
-## Stable limits
+The frozen v1.0 branch passed the exact GitHub CI matrix on Python 3.10 and 3.12.
 
-The engine remains educational: no SQLite binary compatibility, cross-process production locking, MVCC, multi-writer WAL, savepoints, free-list reuse, online VACUUM, or production-calibrated optimizer.
+## Status after v1.0
+
+The educational core is complete. `Plan.md` lists optional extension tracks rather than mandatory missing layers:
+
+```text
+v1.1  Cross-process file locking
+v1.2  Free-list reuse + incremental vacuum
+v1.3  Range scans + composite indexes
+v1.4  Savepoints
+v1.5  Hash/Merge Join + wider enumeration
+v2.0  MVCC experiment
+```
+
+Future work should preserve v1.0 as a frozen learning checkpoint and introduce one major mental model per extension version.

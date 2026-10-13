@@ -1,61 +1,127 @@
-# Agents.md — mini-sqlite v1.0 Frozen Development Contract
+# Agents.md — mini-sqlite Development Contract
 
-> v1.0 is the educationally-complete core. Its dominant mental model is **database lifecycle integrity and maintainability across all previously built layers**.
+> **Mandatory for future work:** read this file before changing code, tests, documentation, branches, storage formats, durability, planning, concurrency, or maintenance semantics.
+>
+> `main` is the canonical integrated state. Historical version branches are frozen learning snapshots.
 
-## 1. Preserve the architecture
+## 1. Repository mission
+
+mini-sqlite is a Python-first educational database engine for understanding the mechanisms behind SQLite-style systems.
+
+Priorities:
 
 ```text
-SQL / Planner / VM
-        ↓
-relational operators / JOIN
-        ↓
-Table + Index B+Trees
-        ↓
-Database + Lock Registry
-        ↓
-Pager + Buffer Manager
-        ↓
-rollback journal / WAL
-        ↓
-disk
-
-Maintenance/diagnostics observe and repair through these public boundaries;
-they must not invent a hidden second storage engine.
+architectural clarity
+      ↓
+correctness + explicit invariants
+      ↓
+readable reference implementation
+      ↓
+mechanism-focused tests
+      ↓
+observable end-to-end behavior
+      ↓
+performance / SQL breadth later
 ```
 
-## 2. Integrity-check contract
+It is not intended to provide SQLite binary compatibility or production database guarantees.
 
-`integrity_check()` must validate structural and logical invariants without mutating the database. It may report stale statistics and unreachable pages as warnings, but structural tree errors, invalid rows, page aliasing, and index/table disagreement are errors.
+## 2. Integrated v1.0 architecture
 
-## 3. REINDEX contract
+```text
+SQL / Parser / AST
+        ↓
+Cost-Based Planner ← ANALYZE statistics
+        ↓
+Compiler / Tiny VM
+        ↓
+Relational operators / JOIN
+        ↓
+Table + Secondary-Index B+Trees
+        ↓
+Database connection / Lock Registry
+        ↓
+Pager
+        ↓
+Bounded Buffer Manager (LRU / CLOCK)
+        ↓
+Rollback Journal OR WAL
+        ↓
+Database file
 
-REINDEX rebuilds derived index state inside ordinary transaction/durability semantics. A failed or rolled-back rebuild must leave the old index usable. Successful rebuild may leave old pages orphaned; VACUUM is responsible for reclaiming them.
+Lifecycle layer:
+ integrity_check · reindex · vacuum · explain_analyze
+```
 
-## 4. VACUUM contract
+Every subsystem must remain at its narrowest useful boundary. Planner choices must not change storage correctness; cache replacement must not bypass durability; maintenance must use normal storage/transaction APIs rather than editing page bytes ad hoc.
 
-VACUUM rewrites the logical database to a same-directory private file and atomically replaces the original. It must preserve:
+## 3. Version history
 
-- schema and table ids as logical schema, not necessarily physical page ids;
-- every committed row;
-- secondary-index definitions and contents;
-- presence of ANALYZE statistics (recomputed exactly);
-- selected connection journal mode after reopen.
+```text
+v0.1  Page/Pager/B+Tree + SQL/Planner/VM
+v0.2  Rollback Journal + Transactions + Crash Recovery
+v0.3  Secondary Index
+v0.4  Relational Execution + UPDATE
+v0.5  INNER JOIN + Indexed Nested Loop
+v0.6  WAL + Read Overlay + Checkpoint
+v0.7  Bounded Buffer Manager + LRU/CLOCK
+v0.8  ANALYZE + Cost-Based Optimizer
+v0.9  Multi-Connection Concurrency + Locks/Snapshots
+v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE        ✅ integrated core
+```
 
-It must reject active transactions and multiple live process-local connections.
+v1.0 is the educationally-complete core. Future releases are optional extension tracks rather than missing prerequisites.
 
-## 5. EXPLAIN ANALYZE contract
+## 4. Branch invariant
 
-It is read-only and SELECT-only. It must report the chosen estimated plan and actual execution metrics without changing query semantics. Timing is educational/diagnostic, not a stable performance API.
+```text
+validated main
+   ↓
+create vX.Y
+   ↓
+implement one dominant mental model
+   ↓
+tests + docs + example
+   ↓
+exact version branch-head CI green
+   ↓
+freeze version branch
+   ↓
+integrate the same validated engine tree into main
+   ↓
+restore canonical main Agents.md / version.md
+```
 
-## 6. Compatibility contract
+Never claim a version is frozen from local tests alone.
 
-Do not silently change the main page, rollback journal, WAL, record, catalog, or secondary-index binary formats in v1.0. Any post-1.0 format change requires a new version and explicit compatibility statement.
+## 5. Core invariants
 
-## 7. Historical invariants remain mandatory
+- SQL frontend never accesses page bytes directly.
+- Planner performs no OS I/O.
+- VM talks to cursors/storage abstractions, not files.
+- B+Trees obtain and mutate pages only through Pager.
+- Pager owns durability ordering.
+- Buffer Manager owns residency/replacement, not durability.
+- pinned frames are never evicted.
+- rollback before-images must become durable before unsafe DB-page writeback.
+- uncommitted WAL dirty frames never leak into the main DB.
+- WAL reads use only complete committed prefixes.
+- connection locking lives above storage structures.
+- schema/index/statistics metadata is persisted through Catalog.
+- root page ids are mutable and owners persist root changes.
+- integrity checking is read-only.
+- REINDEX repairs derived index state through ordinary transactions.
+- VACUUM rebuilds through normal engine APIs and requires exclusive process-local connection ownership.
 
-All v0.1-v0.9 tests must remain green: crash recovery, WAL committed-prefix rules, bounded cache/pin rules, cost choices, and concurrency locks are not weakened by maintenance features.
+## 6. Compatibility rule
 
-## 8. Validation
+Any future incompatible page, record, catalog, rollback-journal, WAL, or index byte-layout change requires an explicit new version, format documentation, reopen/corruption tests, and a compatibility or migration statement.
+
+v1.0 itself does not change the binary formats established by earlier milestones.
+
+## 7. Testing contract
+
+Full core regression:
 
 ```bash
 python -m pytest -q
@@ -72,12 +138,37 @@ python examples/lifecycle.py
 python -m compileall -q mini_sqlite
 ```
 
-`examples/benchmark.py` is optional and illustrative only.
+`examples/benchmark.py` is illustrative only and is not a production benchmark.
 
-## 9. Non-goals
+For new mechanisms include happy paths, invariants, errors, reopen/persistence checks, access-path diagnostics, concurrency/fault/crash cases where relevant, and one educational example.
 
-No cross-process locking, online VACUUM, free-list reuse, MVCC, savepoints, multi-writer WAL, SQLite binary compatibility, or production benchmark claims.
+## 8. Documentation contract
 
-## 10. Frozen-branch rule
+Review when architecture/public behavior changes:
 
-After exact v1.0 branch-head CI is green, permit only documentation corrections, tests clarifying promised behavior, and narrowly scoped defects within v1.0 semantics. New mechanisms belong on post-1.0 extension branches.
+```text
+Agents.md
+Plan.md
+version.md
+README.md
+relevant docs/*
+relevant tests/examples
+```
+
+## 9. Stable v1.0 non-goals
+
+- SQLite file/API parity;
+- cross-process OS locking;
+- MVCC or multi-writer WAL;
+- savepoints;
+- online/incremental VACUUM;
+- free-list page reuse;
+- production cost calibration;
+- query parallelism;
+- production security/performance guarantees.
+
+## 10. Post-1.0 extensions
+
+Optional directions are documented in `Plan.md`, including cross-process locking, free-list reuse, range/composite indexes, savepoints, additional join algorithms, and an MVCC experiment.
+
+Each must be a distinct version with one dominant mental model; do not blur them into the frozen v1.0 branch.
