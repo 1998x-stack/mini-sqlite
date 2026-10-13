@@ -1,67 +1,86 @@
-# mini-sqlite v1.1.0 — Cross-process File Locking
+# Current integrated state — v1.1
 
-## Status
+`main` contains the validated **v1.1 Cross-process File Locking** engine tree on top of the v1.0 educational core.
 
-**Implemented / frozen candidate.**
-
-v1.1 makes the v0.9 connection lock protocol visible to the operating system so independent Python processes can safely share one database file.
-
-## Main mental model
+## Integrated architecture
 
 ```text
-process-local LockRegistry
-        ↓
-POSIX flock backend
-        ↓
-MODE / PENDING / READERS / WRITER
-        ↓
-rollback or WAL durability
+SQL → Parser / AST → Cost-Based Planner → Compiler / VM
+                           ↑                    │
+                    ANALYZE statistics         ↓
+                                    relational ops / JOIN
+                                             ↓
+                                  table/index B+Trees
+                                             ↓
+                                     Database connection
+                                      │              │
+                                      ↓              ↓
+                                LockRegistry     FileLockSet
+                                 local state     POSIX flock
+                                      │              │
+                                      └──────┬───────┘
+                                             ↓
+                                           Pager
+                                             ↓
+                                  Bounded Buffer Manager
+                                             ↓
+                          rollback journal OR WAL/checkpoint
+                                             ↓
+                                        database file
+
+Lifecycle diagnostics / maintenance:
+ integrity_check · reindex · vacuum · explain_analyze
 ```
 
-## New capabilities
+## v1.1 additions
 
-- POSIX `flock` backend for macOS/Linux;
-- cross-process rollback SHARED / RESERVED / EXCLUSIVE behavior;
-- cross-process WAL readers + single writer;
-- cross-process checkpoint exclusion;
-- global live journal-mode agreement;
+- cross-process POSIX `flock` backend on macOS/Linux;
+- persistent MODE / PENDING / READERS / WRITER sidecars whose existence is not liveness;
+- globally-first MODE-EX recovery/bootstrap ownership;
+- live rollback/WAL mode agreement across interpreters;
+- rollback SHARED / RESERVED / EXCLUSIVE semantics across processes;
+- PENDING turnstile preventing reader starvation of writers;
+- WAL concurrent readers + one global writer;
+- checkpoint exclusion across processes;
+- cross-process `busy_timeout_ms`;
 - constructor guard preventing rollback Pager open during EX writer;
-- busy timeout across processes;
-- automatic OS lock release after abrupt process death;
-- globally-first recovery ownership through MODE-EX;
-- cross-process VACUUM exclusion;
-- `.locks` exposes backend + per-connection OS lock state;
-- multiprocessing spawn test suite.
+- kernel auto-release after abrupt process death;
+- hot-journal recovery after `os._exit()`;
+- VACUUM global exclusion;
+- lock observability showing process-local and OS lock state.
 
-## Sidecars
+## Validation
 
-For `demo.db`:
+The frozen `v1.1` branch passed the exact GitHub CI matrix on Python 3.10 and 3.12, including the complete regression suite, lifecycle smoke, cross-process smoke, and compile check.
 
-```text
-demo.db-lock-mode
-demo.db-lock-pending
-demo.db-lock-readers
-demo.db-lock-writer
+```bash
+python -m pytest -q
+python examples/cross_process.py
+python -m compileall -q mini_sqlite
 ```
-
-These files may remain after every connection closes. Only live kernel locks matter.
 
 ## Compatibility
 
-The v1.0 database-page, rollback-journal, and WAL formats are unchanged. v1.0 database files reopen directly in v1.1.
+v1.1 changes no database-page, record, catalog, rollback-journal, WAL, or index byte format. v1.0 database files reopen directly.
 
-## Platform scope
+The cross-process backend is POSIX-only in v1.1; Windows support is intentionally deferred rather than simulated incorrectly.
 
-POSIX/macOS/Linux only for the cross-process backend. Windows support is intentionally deferred rather than emulated incorrectly.
+## Next — v1.2
 
-## Validation target
+**Free-list Page Reuse + Incremental VACUUM**
 
-- all v0.1–v1.0 regression tests;
-- 9 cross-process spawn tests;
-- cross-process smoke example;
-- Python 3.10 / 3.12 CI;
-- `compileall`.
+Planned direction:
 
-## Next
+```text
+page becomes unreachable
+        ↓
+persistent free-list
+        ↓
+future allocation reuses page
+        ↓
+free pages reach file tail
+        ↓
+incremental truncation
+```
 
-**v1.2 — Free-list Page Reuse + Incremental VACUUM**: stop treating deleted/replaced pages as permanently orphaned until full VACUUM; introduce an explicit free-page lifecycle and reuse policy.
+The key invariant is that free-list mutation must obey the same rollback/WAL crash-safety and v1.1 locking rules as ordinary page ownership changes.
