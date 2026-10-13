@@ -14,6 +14,12 @@ class StorageError(MiniSQLiteError):
     pass
 
 
+class BufferPoolFullError(StorageError):
+    """No buffer frame can be evicted without violating pin/durability rules."""
+
+    pass
+
+
 class TransactionError(MiniSQLiteError):
     pass
 

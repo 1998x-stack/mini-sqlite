@@ -35,9 +35,21 @@ class QueryResult:
 class Database:
     """Facade joining SQL frontend, planner, VM, B+Tree, Pager and transactions."""
 
-    def __init__(self, path: str | Path, *, journal_mode: str = "rollback"):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        journal_mode: str = "rollback",
+        buffer_pages: int = 64,
+        replacement_policy: str = "clock",
+    ):
         self.path = Path(path)
-        self.pager = Pager(self.path, journal_mode=journal_mode)
+        self.pager = Pager(
+            self.path,
+            journal_mode=journal_mode,
+            buffer_pages=buffer_pages,
+            replacement_policy=replacement_policy,
+        )
         self.meta = self._open_or_initialize()
         self.tx = TransactionManager(self.pager)
         self._install_runtime()
@@ -53,7 +65,8 @@ class Database:
             self.pager.write_page(META_PAGE_ID, meta.encode())
             self.pager.flush_all()
             return meta
-        return DatabaseMeta.decode(self.pager.get_page(META_PAGE_ID))
+        with self.pager.pin_page(META_PAGE_ID) as page:
+            return DatabaseMeta.decode(page)
 
     def _install_runtime(self) -> None:
         self.catalog = Catalog(self.pager, self.meta, self._persist_meta)
@@ -62,7 +75,8 @@ class Database:
         self.vm = VirtualMachine(self.pager, self.catalog)
 
     def _reload_runtime(self) -> None:
-        self.meta = DatabaseMeta.decode(self.pager.get_page(META_PAGE_ID))
+        with self.pager.pin_page(META_PAGE_ID) as page:
+            self.meta = DatabaseMeta.decode(page)
         self._install_runtime()
 
     def _persist_meta(self, meta: DatabaseMeta) -> None:
@@ -81,6 +95,8 @@ class Database:
 
     def rollback(self) -> None:
         self.tx.rollback()
+        # Catalog/meta objects may have been changed by CREATE TABLE or a B+Tree
+        # root split. Rebuild them from the restored page cache after rollback.
         self._reload_runtime()
 
     @contextmanager
@@ -113,9 +129,9 @@ class Database:
         self._last_code = code
         self._last_explain = self.planner.explain(plan)
 
-        autocommit_write = not self.in_transaction and not isinstance(
-            plan, (SelectPlan, JoinSelectPlan)
-        )
+        # Read-only statements need no rollback journal in autocommit mode.
+        # Any write statement outside BEGIN gets its own durable transaction.
+        autocommit_write = not self.in_transaction and not isinstance(plan, (SelectPlan, JoinSelectPlan))
         if autocommit_write:
             self.begin()
 
@@ -124,6 +140,8 @@ class Database:
             if autocommit_write:
                 self.commit()
         except BaseException:
+            # v0.2+ chooses a simple, safe policy: execution failure aborts the
+            # whole active transaction rather than implementing statement savepoints.
             if self.in_transaction:
                 self.rollback()
             raise
@@ -161,7 +179,9 @@ class Database:
                 cols.append(f"{col.name} {col.type.value}{suffix}")
             chunks.append(f"CREATE TABLE {table.name} ({', '.join(cols)});")
             for index in table.indexes:
-                chunks.append(f"CREATE INDEX {index.name} ON {table.name}({index.column});")
+                chunks.append(
+                    f"CREATE INDEX {index.name} ON {table.name}({index.column});"
+                )
         return "\n".join(chunks)
 
     def indexes_text(self) -> str:
@@ -188,13 +208,14 @@ class Database:
         lines = ["PAGE  TYPE          CELLS  PARENT  RIGHT"]
         lines.append(f"{0:>4}  {'META':<13} {'-':>5}  {'-':>6}  {'-':>5}")
         for page_id in range(1, self.pager.page_count):
-            raw = self.pager.get_page(page_id)
+            with self.pager.pin_page(page_id) as raw:
+                raw_copy = bytes(raw)
             try:
-                node = BTreeNode.decode(page_id, raw)
+                node = BTreeNode.decode(page_id, raw_copy)
                 kind = node.node_type.name
             except Exception:
                 try:
-                    node = IndexNode.decode(page_id, raw)
+                    node = IndexNode.decode(page_id, raw_copy)
                     kind = f"IDX_{node.node_type.name}"
                 except Exception:
                     lines.append(
@@ -206,6 +227,26 @@ class Database:
                 f"{node.parent:>6}  {node.right_sibling:>5}"
             )
         return "\n".join(lines)
+
+    def buffer_status(self) -> str:
+        stats = self.pager.buffer_stats()
+        hit_rate = stats["hit_rate_milli"] / 10
+        return (
+            f"policy={stats['policy']} capacity={stats['capacity']} "
+            f"resident={stats['resident']} dirty={stats['dirty']} pinned={stats['pinned']} "
+            f"hits={stats['hits']} misses={stats['misses']} hit_rate={hit_rate:.1f}% "
+            f"evictions={stats['evictions']} dirty_evictions={stats['dirty_evictions']}"
+        )
+
+    def buffer_frames_text(self) -> str:
+        rows = ["PAGE  DIRTY  PIN  REF  LAST_TOUCH"]
+        for frame in self.pager.buffer_snapshot():
+            rows.append(
+                f"{frame['page_id']:>4}  {str(frame['dirty']):<5}  "
+                f"{frame['pin_count']:>3}  {str(frame['referenced']):<5}  "
+                f"{frame['last_touch']:>10}"
+            )
+        return "\n".join(rows)
 
     def transaction_status(self) -> str:
         stats = self.pager.stats()
@@ -236,10 +277,17 @@ class Database:
         return self.pager.checkpoint()
 
     def flush(self) -> None:
-        """Flush what the active durability mode safely permits."""
+        """Flush what the active durability mode safely permits.
+
+        Rollback mode may write transaction-local pages because the before-image
+        journal can undo them. WAL mode deliberately keeps uncommitted dirty pages
+        out of the main database file; commit appends them to the WAL instead.
+        """
         self.pager.flush_all()
 
     def close(self) -> None:
+        # TransactionManager mirrors Pager state; close must preserve "uncommitted
+        # means rolled back" semantics while leaving no stale manager state.
         if self.in_transaction:
             self.rollback()
         self.pager.close()

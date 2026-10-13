@@ -1,28 +1,27 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
 from mini_sqlite.constants import PAGE_SIZE
 from mini_sqlite.errors import StorageError, TransactionError
+from mini_sqlite.storage.buffer import BufferFrame, BufferManager
 from mini_sqlite.storage.journal import RollbackJournal
 from mini_sqlite.storage.wal import WriteAheadLog
 
 
-@dataclass
-class CachedPage:
-    data: bytearray
-    dirty: bool = False
-
-
 class Pager:
-    """Own fixed-size page I/O, caching, and durability-mode behavior.
+    """Own page I/O, a bounded buffer pool, and durability-mode behavior.
 
-    B+Trees only see logical page operations. Rollback-journal mode uses physical
-    before-images; WAL mode appends committed after-images and overlays them on
-    reads until checkpoint. Query/storage layers stay unaware of that distinction.
+    v0.7 separates two policies that older versions kept in one ``dict``:
+
+    * BufferManager decides which resident frame should leave memory.
+    * Pager decides whether that frame is safe to evict and performs any
+      durability-sensitive write-back through rollback journal or WAL rules.
+
+    B+Trees continue to see logical page operations only.
     """
 
     def __init__(
@@ -31,6 +30,8 @@ class Pager:
         page_size: int = PAGE_SIZE,
         *,
         journal_mode: str = "rollback",
+        buffer_pages: int = 64,
+        replacement_policy: str = "clock",
     ):
         self.path = Path(path)
         self.page_size = page_size
@@ -40,7 +41,8 @@ class Pager:
         self.journal_mode = normalized_mode
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file: BinaryIO = self._open_file()
-        self._cache: dict[int, CachedPage] = {}
+        self.buffer = BufferManager(buffer_pages, replacement_policy)
+
         self._journal: RollbackJournal | None = None
         self._journaled_pages: set[int] = set()
         self._transaction_original_page_count: int | None = None
@@ -100,33 +102,91 @@ class Pager:
     def wal_path(self) -> Path:
         return WriteAheadLog.path_for(self.path)
 
-    def get_page(self, page_id: int) -> bytearray:
-        if page_id < 0 or page_id >= self._page_count:
-            raise StorageError(f"page {page_id} out of range; count={self._page_count}")
-        cached = self._cache.get(page_id)
-        if cached is not None:
-            return cached.data
-
+    def _load_page_bytes(self, page_id: int) -> bytes:
         raw: bytes | None = None
         if self._wal is not None:
             raw = self._wal.read_page(page_id)
-        if raw is None:
-            if page_id >= self._database_page_count:
-                raise StorageError(
-                    f"page {page_id} is not present in database file or committed WAL"
-                )
-            self._file.seek(page_id * self.page_size)
-            raw = self._file.read(self.page_size)
-            if len(raw) != self.page_size:
-                raise StorageError(f"short read for page {page_id}")
-        page = CachedPage(bytearray(raw))
-        self._cache[page_id] = page
-        return page.data
+        if raw is not None:
+            return raw
+        if page_id >= self._database_page_count:
+            raise StorageError(
+                f"page {page_id} is not present in database file or committed WAL"
+            )
+        self._file.seek(page_id * self.page_size)
+        raw = self._file.read(self.page_size)
+        if len(raw) != self.page_size:
+            raise StorageError(f"short read for page {page_id}")
+        return raw
+
+    def _can_evict_frame(self, frame: BufferFrame) -> bool:
+        if not frame.dirty:
+            return True
+        # Uncommitted WAL after-images cannot leak into the database file. v0.7
+        # therefore keeps those frames resident until COMMIT/ROLLBACK. This gives
+        # a visible transaction-working-set limit rather than silently weakening
+        # WAL atomicity.
+        if (
+            self.journal_mode == "wal"
+            and self.in_transaction
+            and frame.page_id in self._transaction_dirty_pages
+        ):
+            return False
+        # Rollback-journal dirty pages are evictable: _evict_frame() first syncs
+        # their before-image journal and only then writes the main database page.
+        return True
+
+    def _evict_frame(self, frame: BufferFrame) -> None:
+        if frame.dirty:
+            self.flush_page(frame.page_id)
+
+    def get_page(self, page_id: int) -> bytearray:
+        """Return a transient page buffer.
+
+        Callers that keep the bytearray while doing additional page fetches should
+        use :meth:`pin_page`. Most engine code decodes immediately and can use this
+        compatibility API safely.
+        """
+
+        if page_id < 0 or page_id >= self._page_count:
+            raise StorageError(f"page {page_id} out of range; count={self._page_count}")
+        frame = self.buffer.fetch(
+            page_id,
+            self._load_page_bytes,
+            can_evict=self._can_evict_frame,
+            on_evict=self._evict_frame,
+        )
+        return frame.data
+
+    @contextmanager
+    def pin_page(self, page_id: int) -> Iterator[bytearray]:
+        if page_id < 0 or page_id >= self._page_count:
+            raise StorageError(f"page {page_id} out of range; count={self._page_count}")
+        frame = self.buffer.fetch(
+            page_id,
+            self._load_page_bytes,
+            pin=True,
+            can_evict=self._can_evict_frame,
+            on_evict=self._evict_frame,
+        )
+        try:
+            yield frame.data
+        finally:
+            self.buffer.unpin(page_id)
 
     def allocate_page(self) -> int:
         page_id = self._page_count
         self._page_count += 1
-        self._cache[page_id] = CachedPage(bytearray(self.page_size), dirty=True)
+        try:
+            self.buffer.install(
+                page_id,
+                bytearray(self.page_size),
+                dirty=True,
+                can_evict=self._can_evict_frame,
+                on_evict=self._evict_frame,
+            )
+        except BaseException:
+            self._page_count -= 1
+            raise
         if self.in_transaction:
             self._transaction_dirty_pages.add(page_id)
         return page_id
@@ -139,15 +199,22 @@ class Pager:
         if page_id < 0 or page_id >= self._page_count:
             raise StorageError(f"page {page_id} out of range")
         self._capture_before_image(page_id)
-        self._cache[page_id] = CachedPage(bytearray(data), dirty=True)
+        self.buffer.install(
+            page_id,
+            data,
+            dirty=True,
+            can_evict=self._can_evict_frame,
+            on_evict=self._evict_frame,
+         )
         if self.in_transaction:
             self._transaction_dirty_pages.add(page_id)
 
     def mark_dirty(self, page_id: int) -> None:
+        # Call mark_dirty *before* mutating a buffer returned by get_page().
         self._capture_before_image(page_id)
-        if page_id not in self._cache:
+        if page_id not in self.buffer:
             self.get_page(page_id)
-        self._cache[page_id].dirty = True
+        self.buffer.mark_dirty(page_id)
         if self.in_transaction:
             self._transaction_dirty_pages.add(page_id)
 
@@ -160,13 +227,15 @@ class Pager:
 
         if self.journal_mode == "wal":
             if page_id not in self._wal_before_images:
-                self._wal_before_images[page_id] = bytes(self.get_page(page_id))
+                with self.pin_page(page_id) as page:
+                    self._wal_before_images[page_id] = bytes(page)
             return
 
         if page_id in self._journaled_pages:
             return
         assert self._journal is not None
-        before = bytes(self.get_page(page_id))
+        with self.pin_page(page_id) as page:
+            before = bytes(page)
         self._journal.append_before_image(page_id, before)
         self._journaled_pages.add(page_id)
         self._journal_needs_sync = True
@@ -199,16 +268,18 @@ class Pager:
 
         if self.journal_mode == "wal":
             assert self._wal is not None
-            frames = [
-                (page_id, bytes(self._cache[page_id].data))
-                for page_id in sorted(self._transaction_dirty_pages)
-            ]
+            frames: list[tuple[int, bytes]] = []
+            for page_id in sorted(self._transaction_dirty_pages):
+                frame = self.buffer.frame(page_id)
+                if frame is None:
+                    raise StorageError(
+                        f"uncommitted WAL page {page_id} left the buffer before commit"
+                    )
+                frames.append((page_id, bytes(frame.data)))
             if frames:
                 self._wal.append_transaction(frames, page_count=self._page_count)
                 for page_id in self._transaction_dirty_pages:
-                    cached = self._cache.get(page_id)
-                    if cached is not None:
-                        cached.dirty = False
+                    self.buffer.mark_clean(page_id)
             self._clear_transaction_state()
             return
 
@@ -227,10 +298,16 @@ class Pager:
         if self.journal_mode == "wal":
             original_count = self._transaction_original_page_count
             for page_id, before in self._wal_before_images.items():
-                self._cache[page_id] = CachedPage(bytearray(before), dirty=False)
-            for page_id in list(self._cache):
+                frame = self.buffer.frame(page_id)
+                if frame is None:
+                    raise StorageError(
+                        f"cannot rollback WAL page {page_id}: frame is not resident"
+                    )
+                frame.data[:] = before
+                frame.dirty = False
+            for page_id in list(self.buffer.page_ids()):
                 if page_id >= original_count:
-                    del self._cache[page_id]
+                    self.buffer.remove(page_id)
             self._page_count = original_count
             self._clear_transaction_state()
             return
@@ -238,7 +315,7 @@ class Pager:
         assert self._journal is not None
         original_count = self._journal.original_page_count
         self._journal.restore_into(self._file)
-        self._cache.clear()
+        self.buffer.clear()
         self._page_count = original_count
         self._database_page_count = original_count
         self._journal.delete()
@@ -253,24 +330,34 @@ class Pager:
         self._journal_needs_sync = False
 
     def flush_page(self, page_id: int) -> None:
-        cached = self._cache.get(page_id)
-        if cached is None or not cached.dirty:
+        frame = self.buffer.frame(page_id)
+        if frame is None or not frame.dirty:
             return
-        if self.journal_mode == "wal" and self.in_transaction:
+        if (
+            self.journal_mode == "wal"
+            and self.in_transaction
+            and page_id in self._transaction_dirty_pages
+        ):
             return
         self._sync_journal_if_needed()
         self._file.seek(page_id * self.page_size)
-        self._file.write(cached.data)
-        cached.dirty = False
+        self._file.write(frame.data)
+        frame.dirty = False
         self._database_page_count = max(self._database_page_count, page_id + 1)
 
     def flush_all(self, sync: bool = True) -> None:
         self._sync_journal_if_needed()
-        for page_id in sorted(self._cache):
+        for page_id in sorted(self.buffer.page_ids()):
             self.flush_page(page_id)
         self._file.flush()
         if sync:
             os.fsync(self._file.fileno())
+
+    def clear_cache(self) -> None:
+        """Flush durability-safe dirty pages and remove every unpinned frame."""
+
+        self.flush_all()
+        self.buffer.clear()
 
     def checkpoint(self) -> int:
         if self.journal_mode != "wal":
@@ -302,11 +389,25 @@ class Pager:
             "wal_bytes": self._wal.file_size,
         }
 
+    def buffer_stats(self) -> dict[str, int | str]:
+        return self.buffer.stats()
+
+    def buffer_snapshot(self) -> list[dict[str, int | bool]]:
+        return self.buffer.snapshot()
+
     def stats(self) -> dict[str, int | bool | str]:
+        buffer_stats = self.buffer.stats()
         return {
             "page_count": self._page_count,
-            "cached_pages": len(self._cache),
-            "dirty_pages": sum(1 for p in self._cache.values() if p.dirty),
+            "cached_pages": len(self.buffer),
+            "dirty_pages": buffer_stats["dirty"],
+            "buffer_capacity": buffer_stats["capacity"],
+            "buffer_policy": buffer_stats["policy"],
+            "buffer_hits": buffer_stats["hits"],
+            "buffer_misses": buffer_stats["misses"],
+            "buffer_evictions": buffer_stats["evictions"],
+            "buffer_dirty_evictions": buffer_stats["dirty_evictions"],
+            "buffer_pinned": buffer_stats["pinned"],
             "transaction_active": self.in_transaction,
             "journal_mode": self.journal_mode,
             "journaled_pages": len(self._journaled_pages),

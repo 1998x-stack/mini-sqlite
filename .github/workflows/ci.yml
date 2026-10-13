@@ -31,5 +31,7 @@ jobs:
         run: python examples/joins.py
       - name: Smoke WAL
         run: python examples/wal.py
+      - name: Smoke buffer pool
+        run: python examples/buffer_pool.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite

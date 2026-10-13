@@ -5,7 +5,7 @@
 ```text
 Database.execute(sql)
         ↓
-Parser -> AST -> Planner -> Plan -> Compiler -> Instruction[] -> VM
+Parser -> AST -> Planner -> Plan -> Compiler -> VM
                                                     │
                        ┌────────────────────────────┴─────────────────────┐
                        ▼                                                  ▼
@@ -16,110 +16,106 @@ Parser -> AST -> Planner -> Plan -> Compiler -> Instruction[] -> VM
                        └────────────────────────┬─────────────────────────┘
                                                 ▼
                                               Pager
-                         ┌───────────────────────┴───────────────────────┐
-                         ▼                                               ▼
-                  rollback mode                                     WAL mode
-            before-image journal                             committed after-images
-                         │                                               │
-                         ▼                                               ▼
-                  database file                              read overlay / checkpoint
-                                                                         │
-                                                                         ▼
-                                                                  database file
+                                                │
+                                                ▼
+                                        Buffer Manager
+                                     frames / pin / LRU-Clock
+                                                │
+                         ┌──────────────────────┴───────────────────────┐
+                         ▼                                              ▼
+                  rollback mode                                    WAL mode
+            before-image journal                            committed after-images
+                         │                                              │
+                         ▼                                              ▼
+                  database file                             overlay / checkpoint
+                                                                        │
+                                                                        ▼
+                                                                 database file
 ```
 
-Parser, Planner, VM and B+Trees never read or write OS files directly. Pager is the durability boundary.
+Parser, Planner, VM and B+Trees never read or write OS files directly.
 
-## 2. Query layers remain unchanged in v0.6
+## 2. v0.7 boundary
 
-v0.6 changes no SQL semantics, row layout, B+Tree page format, catalog encoding, index key format, or JOIN algorithm. It adds a second durability policy below those mechanisms.
-
-That boundary is the core lesson:
+v0.7 changes page residency, not SQL semantics or disk page formats.
 
 ```text
-query meaning
-   ↓
-logical page operations
-   ↓
-Pager durability policy
+B+Tree asks for page N
+        ↓
+Pager logical-page API
+        ↓
+Buffer Manager decides residency
+        ↓
+Pager decides durable source / writeback legality
 ```
 
-## 3. Rollback mode
+The replacement policy does not know what a rollback journal or WAL is.
 
-v0.2 before-image flow remains available and is still the default:
-
-```text
-capture old page
-      ↓
-fsync rollback journal
-      ↓
-write DB page
-      ↓
-fsync DB
-      ↓
-delete journal
-```
-
-## 4. WAL mode
-
-v0.6 changes commit ordering:
-
-```text
-cached new page versions
-      ↓
-append FRAME after-images
-      ↓
-append transaction COMMIT record
-      ↓
-fsync WAL
-      ↓
-logical commit visible
-```
-
-The main DB is not required to contain the newest committed version until checkpoint.
-
-## 5. Pager read overlay
+## 3. Page read path
 
 ```text
 page id
   ↓
-cache?
-  ├─ yes -> cache
-  └─ no
-       ↓
-latest committed WAL frame?
-  ├─ yes -> WAL bytes
-  └─ no  -> main DB bytes
+resident frame?
+  ├─ yes -> hit
+  └─ no  -> miss
+             ↓
+        capacity full?
+          ├─ no
+          └─ yes -> LRU/CLOCK victim
+                       ↓
+                 Pager can evict?
+                       ↓
+                 Pager writeback if dirty
+             ↓
+       Pager logical loader
+          ├─ WAL overlay
+          └─ database page
+             ↓
+       install new frame
 ```
 
-Table/index/catalog code therefore needs no WAL-specific branches.
+## 4. Pinning
 
-## 6. Checkpoint
+Pager exposes an explicit pin lifetime for operations whose page buffer must survive additional page fetches:
 
 ```text
-WAL newest-page map
-       ↓
-copy to main DB
-       ↓
-set committed logical file length
-       ↓
-fsync DB
-       ↓
-reset WAL
+pin -> use across nested fetches -> unpin
 ```
 
-Keeping WAL until DB fsync makes a partial-checkpoint crash recoverable: the WAL still overlays the complete committed state.
+Pinned frames are never replacement candidates. Current synchronous node decoders that consume page bytes immediately may use transient reads without pinning.
 
-## 7. Logical vs physical page count
+## 5. Dirty pages + rollback journal
 
-In WAL mode, committed frames may describe pages beyond the current main-file EOF. Pager therefore distinguishes:
+Rollback mode can evict dirty pages inside a transaction:
 
 ```text
-physical database page count
-logical committed page count
+before-image captured
+      ↓
+journal sync before DB write
+      ↓
+dirty frame writeback
+      ↓
+eviction
 ```
 
-The logical count may be larger until checkpoint extends the main file.
+Rollback can still restore the old page because durability no longer depends on the frame remaining in RAM.
+
+## 6. Dirty pages + WAL
+
+WAL mode deliberately blocks eviction of uncommitted dirty frames:
+
+```text
+active WAL tx dirty frame
+        ↓
+   non-evictable
+```
+
+After COMMIT, WAL is durable, frames become clean, and replacement may discard them. A later miss reloads from the committed WAL overlay.
+
+## 7. Checkpoint independence
+
+Checkpoint reads the WAL's committed newest-page map and writes the database file. It does not depend on which pages happen to be resident in the buffer pool.
 
 ## 8. Cross-version layering invariant
 
@@ -130,6 +126,7 @@ v0.3  secondary index access path
 v0.4  relational row-processing stages
 v0.5  two-source JOIN composition
 v0.6  alternative WAL durability below Pager
+v0.7  bounded page residency between Pager API and durable sources
 ```
 
-Each version adds a mechanism at the narrowest useful boundary instead of replacing earlier layers.
+Each version adds one mechanism at the narrowest useful boundary instead of replacing earlier layers.

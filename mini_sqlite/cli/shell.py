@@ -32,11 +32,22 @@ def _read_statement(first: str) -> str:
     return "\n".join(parts)
 
 
-def repl(path: str | Path, *, journal_mode: str = "rollback") -> None:
-    with Database(path, journal_mode=journal_mode) as db:
+def repl(
+    path: str | Path,
+    *,
+    journal_mode: str = "rollback",
+    buffer_pages: int = 64,
+    replacement_policy: str = "clock",
+) -> None:
+    with Database(
+        path,
+        journal_mode=journal_mode,
+        buffer_pages=buffer_pages,
+        replacement_policy=replacement_policy,
+    ) as db:
         recovered = " (recovery performed)" if db.pager.recovery_performed else ""
         print(
-            f"mini-sqlite v0.6.0 mode={db.pager.journal_mode}{recovered} — .help for commands"
+            f"mini-sqlite v0.7.0 mode={db.pager.journal_mode} buffer={buffer_pages}/{replacement_policy}{recovered} — .help for commands"
         )
         while True:
             try:
@@ -74,6 +85,8 @@ def _meta_command(db: Database, line: str) -> bool:
             ".btree TABLE         dump a table B+Tree\n"
             ".index INDEX         dump a secondary-index B+Tree\n"
             ".txn                 show transaction/durability state\n"
+            ".buffer              show buffer-pool statistics\n"
+            ".frames              show resident buffer frames\n"
             ".wal                 show WAL state\n"
             ".checkpoint          checkpoint committed WAL frames\n"
             ".explain SQL         show planner access path\n"
@@ -88,6 +101,10 @@ def _meta_command(db: Database, line: str) -> bool:
         print(db.pages_text())
     elif cmd == ".txn":
         print(db.transaction_status())
+    elif cmd == ".buffer":
+        print(db.buffer_status())
+    elif cmd == ".frames":
+        print(db.buffer_frames_text())
     elif cmd == ".wal":
         print(db.wal_status())
     elif cmd == ".checkpoint":
@@ -130,8 +147,25 @@ def main() -> None:
         default="rollback",
         help="durability mode (default: rollback)",
     )
+    parser.add_argument(
+        "--buffer-pages",
+        type=int,
+        default=64,
+        help="maximum resident pages in the buffer pool (default: 64)",
+    )
+    parser.add_argument(
+        "--replacement-policy",
+        choices=["clock", "lru"],
+        default="clock",
+        help="buffer replacement policy (default: clock)",
+    )
     args = parser.parse_args()
-    repl(args.database, journal_mode=args.journal_mode)
+    repl(
+        args.database,
+        journal_mode=args.journal_mode,
+        buffer_pages=args.buffer_pages,
+        replacement_policy=args.replacement_policy,
+    )
 
 
 if __name__ == "__main__":

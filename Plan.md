@@ -25,7 +25,7 @@ joins
       ↓
 WAL
       ↓
-buffer manager
+bounded buffer manager
       ↓
 cost optimizer
       ↓
@@ -56,103 +56,141 @@ Aliases, qualified names, ambiguity detection, self-join, plain nested loop, PK 
 
 ### v0.6 — WAL + read overlay + checkpoint ✅
 
+After-image FRAME records, COMMIT boundaries, logical read overlay, torn-tail recovery, checkpoint, page creation beyond DB EOF, rollback/WAL mode switching.
+
+### v0.7 — Bounded Buffer Manager ✅
+
+Central question:
+
+> What changes when the database can no longer keep every touched page in memory?
+
 Implemented:
 
-- explicit rollback/WAL durability mode;
-- documented WAL sidecar format;
-- full-page after-image FRAME records;
-- transaction COMMIT records carrying logical page count and frame count;
-- CRC validation and bounds checking;
-- newest committed frame overlay on Pager reads;
-- private in-memory rollback before WAL commit;
-- torn/uncommitted WAL tail recovery;
-- multiple committed transactions per WAL;
-- checkpoint ordering that keeps WAL until database fsync;
-- partial-checkpoint crash recovery;
-- pages/root splits beyond main-file EOF;
-- WAL -> rollback mode switch through checkpoint;
-- `.wal` / `.checkpoint` inspection;
-- no query/B+Tree rewrite above Pager.
+- configurable fixed frame capacity;
+- `BufferFrame` metadata: page id, bytes, dirty, pin count, replacement state;
+- explicit pin/unpin context;
+- LRU replacement;
+- CLOCK second-chance replacement;
+- hit/miss/eviction/dirty-eviction statistics;
+- rollback dirty eviction after journal-before-DB ordering;
+- WAL blocking of uncommitted dirty eviction;
+- clean committed WAL-frame eviction/reload through overlay;
+- tiny-buffer B+Tree/index/JOIN regression;
+- `.buffer` / `.frames` inspection;
+- no page-format or durability-format change.
 
-## 3. Current next milestone — v0.7 Buffer Manager 🎯
+## 3. Current next milestone — v0.8 Cost-Based Optimizer 🎯
 
 ### Central question
 
-> What changes when the database can no longer keep every touched page in memory, and page residency becomes a bounded resource that must be pinned, evicted, measured, and written back safely?
+> When several correct plans exist, how can the database estimate their work and choose a plan from data rather than from fixed rules?
 
-v0.1-v0.6 use an effectively unbounded Python dictionary cache. v0.7 should turn that hidden convenience into an explicit subsystem.
+v0.3-v0.5 introduced physical alternatives but Planner selection is still mostly heuristic: PK equality beats secondary equality, otherwise scan; JOIN outer/inner order is syntax-driven.
 
 ### Target architecture
 
 ```text
-B+Tree / Index / Catalog
+Catalog statistics
+   ├─ row count
+   ├─ distinct count
+   ├─ min / max
+   └─ optional histograms
           ↓
-       Pager API
+Cardinality estimator
           ↓
-    Buffer Manager
-  ┌────────┼─────────┐
-  ▼        ▼         ▼
-frames   replacer   stats
-  │      LRU/Clock   hit/miss
-  │
-  ├─ pin count
-  ├─ dirty bit
-  └─ page id
+Cost model
+   ├─ table scan
+   ├─ PK seek
+   ├─ index seek + row lookup
+   └─ nested-loop alternatives
           ↓
- durability layer
- rollback / WAL
+Candidate plans
           ↓
-      disk files
+choose min estimated cost
+          ↓
+EXPLAIN estimated rows / cost
 ```
 
-### v0.7.1 bounded frames
+### v0.8.1 ANALYZE / statistics
 
-Introduce a configurable capacity, for example:
-
-```python
-Database("demo.db", buffer_pages=32)
-```
-
-The buffer manager owns a fixed number of frames rather than allowing `_cache` to grow forever.
-
-### v0.7.2 pin / unpin
-
-A page currently in use by a cursor/tree operation cannot be evicted.
+Add a small statistics subsystem rather than reading the entire table during every planning decision. Suggested first metadata:
 
 ```text
-fetch page -> pin_count += 1 -> use page -> unpin -> pin_count -= 1
+table row_count
+column distinct_count
+column null_count
+column min/max for INTEGER
+index metadata
 ```
 
-### v0.7.3 replacement policy
+Statistics should be persistent or explicitly recomputable, with a clear staleness model.
 
-Implement one readable policy first, preferably LRU or Clock. Eviction candidates require `pin_count == 0`.
+### v0.8.2 selectivity estimation
 
-Dirty eviction must respect the active durability mode rather than bypassing WAL/journal ordering.
+Teach simple estimates first:
 
-### v0.7.4 observability
+```text
+PK equality            ≈ 1 row
+indexed equality       ≈ N / distinct
+range on INTEGER       ≈ fraction from min/max
+unknown predicate      conservative fallback
+```
 
-Expose capacity, resident/pinned/dirty pages, hits, misses, evictions, writebacks and hit ratio. A `.buffer` command would make the mechanism visible.
+Correctness must never depend on estimate quality; estimates only choose among equivalent plans.
 
-### v0.7.5 durability interaction
+### v0.8.3 access-path costs
 
-- rollback mode must preserve journal-before-database ordering;
-- WAL mode must never write uncommitted pages into the main DB;
-- committed WAL-backed pages may be evicted because WAL is durable truth;
-- checkpoint should remain independent of residency.
+Expose comparable conceptual costs, for example:
 
-### Definition of Done for v0.7
+```text
+table scan              pages(table)
+PK seek                 tree_height + 1
+secondary equality      index_height + matches * table_lookup
+```
 
-Tests should prove capacity bounds, pin safety, replacement behavior, dirty writeback correctness in rollback mode, WAL correctness under eviction, query correctness with tiny buffers, inspectable metrics, and green reopen/crash regression on the exact final branch head.
+Use buffer-aware page concepts, but do not pretend to model real hardware precisely.
 
-### Explicit non-goals for v0.7
+### v0.8.4 JOIN order
 
-No async I/O, direct-I/O tuning, prefetcher, ARC/2Q sophistication, multi-connection lock manager, cost optimizer, or production-grade memory accounting.
+For two-table INNER JOIN, compare at least both legal nested-loop orientations:
+
+```text
+A outer -> B inner
+B outer -> A inner
+```
+
+Include whether the chosen inner side has PK/index lookup. This is the first version where SQL FROM order should not necessarily equal physical join order.
+
+### v0.8.5 EXPLAIN observability
+
+Show:
+
+```text
+estimated rows
+estimated cost
+chosen access path
+rejected alternatives
+join orientation
+```
+
+The teaching goal is to make optimizer reasoning auditable.
+
+### Definition of Done for v0.8
+
+- statistics can be collected deterministically;
+- equality/range estimates have tests;
+- scan vs index choice can flip with data distribution;
+- JOIN orientation can flip based on cardinality/indexes;
+- EXPLAIN exposes estimates/costs;
+- stale/missing stats have safe fallbacks;
+- all v0.1-v0.7 storage/durability/buffer tests stay green;
+- exact final branch-head CI passes.
+
+### Explicit non-goals for v0.8
+
+No Selinger-style exhaustive many-way JOIN optimizer, sophisticated histograms, adaptive runtime reoptimization, vectorized execution, ML cardinality estimation, or concurrent DDL/statistics maintenance.
 
 ## 4. Future milestones
-
-### v0.8 — Cost-based optimizer
-
-Statistics, cardinality/selectivity estimation, scan/index costing, join-order costing, `ANALYZE`.
 
 ### v0.9 — Concurrency and locking
 
@@ -160,7 +198,7 @@ Connection abstraction, lock states, busy timeout, concurrent-process tests, tra
 
 ### v1.0 — Educationally complete mini SQLite
 
-Durable rollback/WAL modes, primary/secondary indexes, relational operators and joins, bounded page cache, explainable planning, crash tests, documented formats, benchmark/inspection tooling.
+Durable rollback/WAL modes, primary/secondary indexes, relational operators and joins, bounded page cache, explainable cost planning, crash tests, documented formats, benchmark/inspection tooling.
 
 ## 5. Version-development protocol
 

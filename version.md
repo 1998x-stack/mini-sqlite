@@ -1,60 +1,64 @@
-# Current integrated state — v0.6
+# mini-sqlite v0.7
 
-`main` currently contains the validated **v0.6 WAL** implementation on top of the v0.1 page/B+Tree/SQL/VM, v0.2 rollback-journal transactions, v0.3 secondary indexes, v0.4 relational execution, and v0.5 JOIN foundations.
+## Theme
 
-## Integrated architecture
+**Bounded page residency with pin/unpin, LRU/CLOCK replacement, and durability-aware dirty eviction.**
+
+Earlier versions quietly kept every touched page in an unbounded Python dictionary. v0.7 makes memory pressure explicit:
 
 ```text
-SQL → Parser / AST → Planner → Compiler / VM
-                                  │
-                         relational ops / JOIN
-                                  ↓
-                       table/index B+Trees
-                                  ↓
-                                Pager
-              ┌───────────────────┴───────────────────┐
-              ▼                                       ▼
-       rollback journal                              WAL
-       before-images                     committed after-image frames
-              │                              + read overlay
-              ▼                                       │
-        database file                              checkpoint
-                                                      │
-                                                      ▼
-                                                database file
+database pages >> buffer frames
+         ↓
+cache hit / miss
+         ↓
+replacement candidate
+         ↓
+pin + durability checks
+         ↓
+evict / write back
 ```
 
-## Current capabilities
+## Delta from v0.6
 
-- persistent 4 KiB page file and slotted B+Trees;
-- tokenizer/parser/AST/planner/tiny VM;
-- CREATE TABLE/INDEX, INSERT/SELECT/DELETE/UPDATE;
-- rollback-journal BEGIN/COMMIT/ROLLBACK and crash recovery;
-- secondary-index equality paths and atomic table/index maintenance;
-- comparisons, ORDER BY, LIMIT, scalar aggregates;
-- INNER JOIN, aliases, qualified names, self-join;
-- plain, primary-key indexed, and secondary-index indexed nested loops;
-- explicit `journal_mode="rollback" | "wal"`;
-- WAL page after-image frames + transaction COMMIT boundaries;
-- CRC validation and torn/uncommitted-tail recovery;
-- newest committed WAL frame overlay on reads;
-- WAL page creation beyond main-file EOF;
-- explicit crash-safe checkpoint;
-- deterministic WAL → rollback mode switch by checkpoint;
-- `.txn`, `.wal`, `.checkpoint`, page/tree/index/plan/bytecode inspection.
+Added:
 
-## Recommended reading order for the latest mechanism
+- `Database(..., buffer_pages=N)`;
+- `replacement_policy="clock" | "lru"`;
+- explicit `BufferFrame` and `BufferManager`;
+- bounded resident-page invariant;
+- pin/unpin page lifetime through `Pager.pin_page()`;
+- LRU replacement;
+- CLOCK second-chance replacement;
+- durability-aware dirty victim checks;
+- rollback-mode dirty writeback + eviction inside active transactions;
+- WAL protection for uncommitted dirty frames;
+- cache hit/miss/eviction/dirty-eviction metrics;
+- `.buffer` and `.frames` shell commands;
+- `docs/BUFFER_MANAGER.md`;
+- `examples/buffer_pool.py`;
+- `tests/test_buffer_manager.py`.
 
-1. `docs/TRANSACTIONS.md`
-2. `docs/WAL.md`
-3. `mini_sqlite/storage/wal.py`
-4. `mini_sqlite/storage/pager.py`
-5. `tests/test_wal.py`
-6. `examples/wal.py`
+## Important source files
 
-For query/index/JOIN mechanics, read `docs/RELATIONAL_ENGINE.md`, `docs/INDEXES.md`, and `docs/JOINS.md`.
+- `mini_sqlite/storage/buffer.py`
+- `mini_sqlite/storage/pager.py`
+- `mini_sqlite/btree/btree.py`
+- `mini_sqlite/index/btree.py`
+- `mini_sqlite/database.py`
+- `tests/test_buffer_manager.py`
+- `docs/BUFFER_MANAGER.md`
 
-## Validation commands
+## Recommended reading order
+
+1. `docs/BUFFER_MANAGER.md`
+2. `storage/buffer.py`
+3. `storage/pager.py`
+4. `tests/test_buffer_manager.py`
+5. `docs/TRANSACTIONS.md`
+6. `docs/WAL.md`
+7. `examples/buffer_pool.py`
+
+## Validation
 
 ```bash
 python -m pytest -q
@@ -64,9 +68,22 @@ python examples/indexes.py
 python examples/relational.py
 python examples/joins.py
 python examples/wal.py
+python examples/buffer_pool.py
 python -m compileall -q mini_sqlite
 ```
 
+## Storage compatibility
+
+The main DB page layout, rollback-journal format, and WAL format are unchanged from v0.6. v0.7 changes only in-memory residency and public configuration.
+
+## Important limitation
+
+In WAL mode, uncommitted dirty frames are deliberately non-evictable. A transaction whose dirty working set exceeds `buffer_pages` raises `BufferPoolFullError`. This keeps WAL atomicity obvious without adding a second hidden unbounded transaction cache or spill file.
+
+## Explicit non-goals
+
+No async I/O, prefetching, mmap/direct-I/O tuning, ARC/2Q, shared cache, transaction spill file, concurrent buffer access, cost-based planning, or multi-connection lock manager.
+
 ## Next
 
-See `Plan.md`: **v0.7 Bounded Buffer Manager** — replace the hidden unbounded page cache with explicit capacity, pin/unpin semantics, replacement policy, eviction/writeback invariants, and observable hit/miss/eviction metrics while preserving both rollback and WAL durability rules.
+v0.8 should add a **cost-based optimizer**: persisted/analyzed statistics, cardinality/selectivity estimates, comparable access-path costs, and JOIN-order decisions that can be inspected rather than hard-coded.
