@@ -38,16 +38,18 @@ def repl(
     journal_mode: str = "rollback",
     buffer_pages: int = 64,
     replacement_policy: str = "clock",
+    busy_timeout_ms: int = 0,
 ) -> None:
     with Database(
         path,
         journal_mode=journal_mode,
         buffer_pages=buffer_pages,
         replacement_policy=replacement_policy,
+        busy_timeout_ms=busy_timeout_ms,
     ) as db:
         recovered = " (recovery performed)" if db.pager.recovery_performed else ""
         print(
-            f"mini-sqlite v0.7.0 mode={db.pager.journal_mode} buffer={buffer_pages}/{replacement_policy}{recovered} — .help for commands"
+            f"mini-sqlite v0.9.0 mode={db.pager.journal_mode} buffer={buffer_pages}/{replacement_policy}{recovered} — .help for commands"
         )
         while True:
             try:
@@ -85,6 +87,7 @@ def _meta_command(db: Database, line: str) -> bool:
             ".btree TABLE         dump a table B+Tree\n"
             ".index INDEX         dump a secondary-index B+Tree\n"
             ".txn                 show transaction/durability state\n"
+            ".locks               show connection lock state\n"
             ".buffer              show buffer-pool statistics\n"
             ".frames              show resident buffer frames\n"
             ".wal                 show WAL state\n"
@@ -101,6 +104,8 @@ def _meta_command(db: Database, line: str) -> bool:
         print(db.pages_text())
     elif cmd == ".txn":
         print(db.transaction_status())
+    elif cmd == ".locks":
+        print(db.lock_status())
     elif cmd == ".buffer":
         print(db.buffer_status())
     elif cmd == ".frames":
@@ -159,12 +164,19 @@ def main() -> None:
         default="clock",
         help="buffer replacement policy (default: clock)",
     )
+    parser.add_argument(
+        "--busy-timeout-ms",
+        type=int,
+        default=0,
+        help="wait this many milliseconds for connection locks (default: 0)",
+    )
     args = parser.parse_args()
     repl(
         args.database,
         journal_mode=args.journal_mode,
         buffer_pages=args.buffer_pages,
         replacement_policy=args.replacement_policy,
+        busy_timeout_ms=args.busy_timeout_ms,
     )
 
 

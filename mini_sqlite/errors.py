@@ -24,6 +24,24 @@ class TransactionError(MiniSQLiteError):
     pass
 
 
+class BusyError(TransactionError):
+    """A connection could not obtain a required database lock."""
+
+    pass
+
+
+class BusySnapshotError(BusyError):
+    """A WAL read snapshot became stale before a write upgrade."""
+
+    pass
+
+
+class JournalModeConflictError(BusyError):
+    """Live connections disagree about rollback vs WAL mode."""
+
+    pass
+
+
 class DuplicateKeyError(MiniSQLiteError):
     pass
 

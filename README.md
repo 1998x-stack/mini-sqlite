@@ -1,37 +1,33 @@
 # mini-sqlite
 
-A readable SQLite-inspired database engine that removes one layer of database “magic” per version. It is not a wrapper around Python `sqlite3`: tables, indexes, transactions, WAL, buffer residency, and optimizer statistics are implemented in this repository.
+A readable SQLite-inspired database engine built as a sequence of small architectural milestones. It is not a wrapper around Python `sqlite3` and it is not SQLite file-format compatible.
 
-## Current version: v0.8 — Cost-Based Optimizer
+## Current milestone: v0.9 — Concurrency / Locking
 
 ```text
-SQL
- ↓
-Parser / AST
- ↓
-Planner
- ├─ persistent ANALYZE statistics
- ├─ cardinality/selectivity estimator
- ├─ access-path candidates
- └─ JOIN-order candidates
- ↓
-Cost Model
- ↓
-chosen physical plan
- ↓
-Compiler / VM
- ↓
-relational pipeline / JOIN
- ↓
-Table + Index B+Trees
- ↓
-Pager
- ↓
-Bounded Buffer Manager (LRU/CLOCK)
- ↓
-Rollback Journal or WAL
- ↓
-Disk
+SQL -> Parser / AST
+          ↓
+   Cost-Based Planner
+          ↓
+   Compiler / Tiny VM
+          ↓
+ relational ops / JOIN
+          ↓
+ table + index B+Trees
+          ↓
+       Database connection
+          ↓
+       Lock Registry
+          ↓
+         Pager
+          ↓
+ Bounded Buffer Manager
+    ├─ LRU
+    └─ CLOCK
+          ↓
+ rollback journal OR WAL
+          ↓
+         disk
 ```
 
 Version progression:
@@ -44,98 +40,68 @@ v0.4  Relational Execution + UPDATE
 v0.5  INNER JOIN + Indexed Nested Loop
 v0.6  WAL + Read Overlay + Checkpoint
 v0.7  Bounded Buffer Manager + LRU/CLOCK
-v0.8  Cost-Based Optimizer + ANALYZE            ← current
-v0.9  Concurrency / Locking                     ← next
+v0.8  ANALYZE + Cost-Based Optimizer
+v0.9  Multi-Connection Concurrency + Locks        <- current
+v1.0  Educationally Complete                     <- next
 ```
 
-## What v0.8 adds
+## What v0.9 adds
 
-```sql
-ANALYZE;
-ANALYZE users;
-```
-
-The catalog stores a statistics snapshot containing row count plus per-column NULL count, distinct count, min/max, and top-16 most-common-value frequencies. Planner uses those statistics to compare correct physical alternatives rather than blindly preferring an available index.
-
-### Index can lose to a scan
-
-For 100 rows where `grp=1` occurs 90 times:
-
-```text
-TABLE SCAN                cost=100
-SECONDARY INDEX idx_grp   cost=200
-```
-
-so `SELECT * FROM users WHERE grp = 1;` chooses a table scan. For a one-row value, the same query shape chooses the index because its estimated cost is about 4.2.
-
-### JOIN order can differ from SQL order
-
-```sql
-SELECT big.id, small.id
-FROM big
-JOIN small ON big.k = small.k;
-```
-
-may explain as `PHYSICAL ORDER small -> big`. If `big(k)` is indexed, the chosen plan can use `small` as outer and probe the secondary index on `big`, while logical result column order remains `big, small`.
-
-## Cost model
-
-v0.8 intentionally uses transparent abstract units:
-
-```text
-TABLE_ROW_COST       = 1.0
-PK_SEEK_COST         = 2.0
-INDEX_SEEK_COST      = 2.0
-INDEX_MATCH_COST     = 0.20
-ROWID_LOOKUP_COST    = 2.0
-```
-
-These are teaching constants, not latency predictions.
-
-## Statistics are snapshots
-
-```text
-ANALYZE -> stats saved -> writes may make stats stale -> ANALYZE again
-```
-
-Correctness never depends on statistics. Missing statistics fall back to the historical v0.7 rule planner.
-
-## EXPLAIN
-
-After ANALYZE:
-
-```text
-SELECT FROM users USING TABLE SCAN
-| EST rows=90.00 cost=100.00
-| CANDIDATES TABLE SCAN:cost=100.00;
-  SECONDARY INDEX idx_users_grp:cost=200.00
-| FILTER grp = 1
-| PROJECT ...
-```
-
-JOIN EXPLAIN also shows physical order and both orientation costs.
-
-## Python quick start
+Multiple live connections can now coordinate against one database path:
 
 ```python
 from mini_sqlite import Database
 
-with Database("demo.db", buffer_pages=32) as db:
-    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, grp INTEGER);")
-    db.execute("CREATE INDEX idx_grp ON users(grp);")
-    # load data ...
-    db.execute("ANALYZE users;")
-    print(db.catalog.get_table("users").stats)
-    print(db.explain("SELECT * FROM users WHERE grp = 1;"))
+reader = Database("demo.db")
+writer = Database("demo.db", busy_timeout_ms=250)
 ```
+
+### Rollback mode
+
+```text
+reader A: SHARED
+reader B: SHARED
+writer C: RESERVED -> waits for readers -> EXCLUSIVE
+```
+
+Rollback mode writers need EXCLUSIVE because uncommitted dirty pages may reach the main database before COMMIT and must remain invisible to other readers.
+
+Read-only explicit transactions use a **lazy rollback journal**: `BEGIN` alone creates no `<db>-journal`; the sidecar is created only on first physical write.
+
+### WAL mode
+
+```text
+reader A: SHARED snapshot S1
+writer B: WAL_WRITE -> COMMIT S2
+reader A: still sees S1
+new statement: sees S2
+```
+
+Readers coexist with one WAL writer. If an old WAL reader tries to upgrade into a writer after somebody else committed, mini-sqlite raises `BusySnapshotError` rather than writing from stale state.
+
+### Busy handling
+
+```python
+Database("demo.db", busy_timeout_ms=500)
+```
+
+`0` fails immediately. Positive values wait on a condition variable until a conflicting connection releases its lock or the timeout expires.
+
+### Lock inspection
+
+`Database.lock_status()` and CLI `.locks` expose the current connection and global path state.
+
+## v0.8 optimizer remains intact
+
+`ANALYZE` statistics still drive scan/index and JOIN-order cost choices. Locking sits below planning: concurrency changes when a connection may execute and which snapshot it sees, not SQL semantics or cost formulas.
 
 ## CLI
 
 ```bash
-mini-sqlite demo.db
+mini-sqlite demo.db --busy-timeout-ms 250
 ```
 
-Useful commands include `.schema`, `.indexes`, `.pages`, `.btree TABLE`, `.index INDEX`, `.txn`, `.wal`, `.checkpoint`, `.buffer`, `.frames`, `.explain SQL`, and `.bytecode SQL`.
+Useful commands include `.schema`, `.indexes`, `.pages`, `.btree`, `.index`, `.explain`, `.bytecode`, `.txn`, `.locks`, `.buffer`, `.frames`, `.wal`, and `.checkpoint`.
 
 ## Validate
 
@@ -150,30 +116,23 @@ python examples/joins.py
 python examples/wal.py
 python examples/buffer_pool.py
 python examples/optimizer.py
+python examples/concurrency.py
 python -m compileall -q mini_sqlite
 ```
 
-## Project map
+## Key v0.9 files
 
 ```text
-mini_sqlite/
-├── catalog/
-│   ├── catalog.py       # persisted schema + ANALYZE scan
-│   ├── schema.py        # table/index metadata + optional stats
-│   └── statistics.py    # v0.8 TableStats / ColumnStats
-├── planner/
-│   ├── optimizer.py     # cardinality + cost model + candidates
-│   ├── cost_planner.py  # v0.8 cost-aware physical selection
-│   ├── planner.py       # v0.7 binder / logical planning base
-│   └── plan.py
-├── vm/                  # legacy VM + thin v0.8 cost compiler/ANALYZE adapter
-├── btree/               # primary table B+Tree
-├── index/               # secondary B+Tree
-└── storage/
-    ├── buffer.py        # bounded v0.7 buffer pool
-    ├── pager.py
-    ├── journal.py
-    └── wal.py
+mini_sqlite/concurrency/lock.py
+mini_sqlite/database.py
+mini_sqlite/storage/pager.py
+mini_sqlite/storage/wal.py
+mini_sqlite/errors.py
+tests/test_concurrency.py
+examples/concurrency.py
+docs/CONCURRENCY.md
 ```
 
-Read `docs/OPTIMIZER.md` for the v0.8 model and limitations.
+## Important limit
+
+v0.9 concurrency is **process-local**. Two `Database` objects in one Python process coordinate correctly; this release does not claim cross-process operating-system locking.

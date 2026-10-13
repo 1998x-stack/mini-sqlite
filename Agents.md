@@ -1,86 +1,62 @@
-# Agents.md — mini-sqlite Development Contract
+# Agents.md — mini-sqlite v0.9 Frozen Development Contract
 
-> Canonical contract for `main`. Read before changing architecture, storage, planner, caching, durability, statistics, or connection semantics.
+> This branch teaches one dominant mental model: **multiple connections require explicit lock state and snapshot rules in addition to crash durability**.
 
-## Mission
-
-mini-sqlite is an educational, Python-first database engine. Each version introduces one dominant database mental model while preserving earlier invariants.
-
-## Branch protocol
+## 1. Preserve the layer boundary
 
 ```text
-latest validated main
-   ↓
-create vX.Y
-   ↓
-one dominant mechanism
-   ↓
-tests + docs + example
-   ↓
-exact branch-head CI green
-   ↓
-freeze version branch
-   ↓
-integrate same engine tree into main
-   ↓
-restore canonical main docs
+SQL / Planner / VM / B+Trees
+             ↓
+          Database
+             ↓
+      Lock Registry
+             ↓
+           Pager
+      ┌──────┴──────┐
+   rollback        WAL
 ```
 
-`main` must represent the newest validated integrated state.
+Do not move lock acquisition into B+Tree nodes, the optimizer, or Buffer Manager.
 
-## Integrated milestones
+## 2. Scope
 
-```text
-v0.1  pages / B+Tree / SQL / Planner / VM
-v0.2  rollback transactions / crash recovery
-v0.3  secondary indexes
-v0.4  relational execution / UPDATE / aggregates
-v0.5  JOIN / indexed nested loop
-v0.6  WAL / overlay / checkpoint
-v0.7  bounded Buffer Manager / LRU / CLOCK
-v0.8  ANALYZE / persistent statistics / cost-based optimizer   ← integrated
-v0.9  concurrency / locking                                    ← next
-v1.0  educationally complete
-```
+The registry is process-local and keyed by canonical database path. Cross-process OS locking is not part of v0.9.
 
-## Current architecture
+## 3. Rollback invariants
 
-```text
-SQL -> Parser -> AST -> Planner
-                         │
-                  stats + CostModel
-                         ↓
-                  physical plan
-                         ↓
-                Compiler / VM
-                         ↓
-              relations / JOIN
-                         ↓
-             table/index B+Trees
-                         ↓
-                       Pager
-                         ↓
-              Bounded Buffer Manager
-                  ├─ LRU
-                  └─ CLOCK
-                         ↓
-             rollback journal or WAL
-                         ↓
-                        disk
-```
+- multiple SHARED readers may coexist;
+- one RESERVED writer intent at a time;
+- EXCLUSIVE requires no other SHARED readers;
+- no reader may execute while another connection owns EXCLUSIVE;
+- rollback journal is lazy and created only at first physical write/new page;
+- dirty rollback pages may still evict only after journal-before-DB ordering.
 
-## Architecture rules
+## 4. WAL invariants
 
-- SQL frontend never reads page bytes directly.
-- Planner chooses physical work but performs no file I/O.
-- B+Trees obtain logical pages only through Pager.
-- Buffer Manager decides residency; Pager decides durability legality.
-- rollback/WAL remain interchangeable policies below the same page API.
-- optimizer estimates may change performance, never correctness.
-- statistics are persisted catalog metadata and may be stale until ANALYZE.
-- future locking belongs at connection/transaction boundaries, not inside B+Tree nodes.
+- multiple SHARED reader snapshots may coexist with one WAL writer;
+- only one WAL writer exists;
+- explicit reader snapshot does not refresh until COMMIT/ROLLBACK;
+- stale reader snapshot cannot upgrade to writer after another WAL commit;
+- checkpoint must not race an explicit reader snapshot or WAL writer;
+- reader refresh never truncates a live partial WAL tail.
 
-## Current validation
+## 5. Busy contract
+
+`busy_timeout_ms=0` fails immediately. Positive timeout waits on a condition variable and expires deterministically. Never spin indefinitely.
+
+## 6. Cache-coherence contract
+
+A connection refreshes its clean Pager/buffer view only when beginning a new statement/transaction snapshot under the correct connection lock. Active transactions never refresh.
+
+## 7. Cleanup contract
+
+COMMIT, ROLLBACK, statement failure that aborts the transaction, and CLOSE must release connection locks. Crash-simulation tests may close Pager directly; liveness pruning must make later recovery possible.
+
+## 8. Testing contract
+
+Keep every v0.1-v0.8 test green and cover reader-reader, reader-writer, writer-writer, timeout wake/expiry, WAL snapshot isolation, stale upgrade, checkpoint conflict, error cleanup, mixed journal modes, and recovery.
+
+## 9. Validation
 
 ```bash
 python -m pytest -q
@@ -92,15 +68,14 @@ python examples/joins.py
 python examples/wal.py
 python examples/buffer_pool.py
 python examples/optimizer.py
+python examples/concurrency.py
 python -m compileall -q mini_sqlite
 ```
 
-## Current directive
+## 10. Non-goals
 
-`main` contains the validated **v0.8 Cost-Based Optimizer** milestone.
+No OS cross-process locks, row/predicate locks, deadlock detector, MVCC, savepoints, distributed locking, or multi-writer WAL.
 
-Next: **v0.9 Concurrency / Locking**.
+## 11. Definition of Done
 
-Central question:
-
-> What changes when two independent connections can read or write the same database while preserving transaction isolation, rollback/WAL durability, cache coherence, and deterministic busy behavior?
+The exact final v0.9 branch-head must pass all tests and examples on CI, lock transitions must be inspectable, conflicts deterministic, WAL/rollback behavior distinct and documented, old durability tests must remain green, and no on-disk format may change accidentally.

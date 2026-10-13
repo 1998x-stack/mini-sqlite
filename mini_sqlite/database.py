@@ -8,11 +8,13 @@ from typing import Any, Iterator
 from mini_sqlite.btree import BTree
 from mini_sqlite.catalog import Catalog
 from mini_sqlite.constants import META_PAGE_ID
+from mini_sqlite.concurrency import LockRegistry
+from mini_sqlite.errors import BusySnapshotError
 from mini_sqlite.index import ByteKeyBTree
 from mini_sqlite.planner import Planner
 from mini_sqlite.planner.plan import JoinSelectPlan, SelectPlan
 from mini_sqlite.sql import Parser
-from mini_sqlite.sql.ast import BeginStmt, CommitStmt, RollbackStmt
+from mini_sqlite.sql.ast import BeginStmt, CommitStmt, RollbackStmt, SelectStmt as SelectStmtAst
 from mini_sqlite.storage.meta import DatabaseMeta
 from mini_sqlite.storage.pager import Pager
 from mini_sqlite.transaction import TransactionManager
@@ -42,19 +44,39 @@ class Database:
         journal_mode: str = "rollback",
         buffer_pages: int = 64,
         replacement_policy: str = "clock",
+        busy_timeout_ms: int = 0,
     ):
         self.path = Path(path)
-        self.pager = Pager(
-            self.path,
-            journal_mode=journal_mode,
-            buffer_pages=buffer_pages,
-            replacement_policy=replacement_policy,
+        self.busy_timeout_ms = busy_timeout_ms
+        normalized_mode = journal_mode.lower().strip()
+        registration = LockRegistry.register(
+            self.path, normalized_mode, timeout_ms=busy_timeout_ms
         )
-        self.meta = self._open_or_initialize()
-        self.tx = TransactionManager(self.pager)
-        self._install_runtime()
-        self._last_code = []
-        self._last_explain = ""
+        self.connection_id = registration.connection_id
+        self._registered = True
+        self._snapshot_wal_signature: tuple[int, int] | None = None
+        try:
+            self.pager = Pager(
+                self.path,
+                journal_mode=normalized_mode,
+                buffer_pages=buffer_pages,
+                replacement_policy=replacement_policy,
+                recover=registration.first_connection,
+            )
+            LockRegistry.bind_liveness(
+                self.path,
+                self.connection_id,
+                lambda: not self.pager._file.closed and self._registered,
+            )
+            self.meta = self._open_or_initialize()
+            self.tx = TransactionManager(self.pager)
+            self._install_runtime()
+            self._last_code = []
+            self._last_explain = ""
+        except BaseException:
+            LockRegistry.unregister(self.path, self.connection_id)
+            self._registered = False
+            raise
 
     def _open_or_initialize(self) -> DatabaseMeta:
         if self.pager.page_count == 0:
@@ -87,17 +109,92 @@ class Database:
     def in_transaction(self) -> bool:
         return self.tx.active
 
+    def _refresh_view(self) -> None:
+        self.pager.refresh_from_disk()
+        if self.pager.page_count == 0:
+            return
+        self._reload_runtime()
+
+    def _acquire_shared_snapshot(self) -> None:
+        LockRegistry.acquire_shared(
+            self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+        )
+        try:
+            self._refresh_view()
+            self._snapshot_wal_signature = self.pager.wal_signature()
+        except BaseException:
+            LockRegistry.release_all(self.path, self.connection_id)
+            raise
+
+    def _acquire_autocommit_write(self) -> None:
+        try:
+            if self.pager.journal_mode == "rollback":
+                LockRegistry.acquire_reserved(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+                LockRegistry.acquire_exclusive(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+            else:
+                LockRegistry.acquire_wal_writer(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+            self._refresh_view()
+            self._snapshot_wal_signature = self.pager.wal_signature()
+        except BaseException:
+            LockRegistry.release_all(self.path, self.connection_id)
+            raise
+
+    def _upgrade_explicit_write(self) -> None:
+        if self.pager.journal_mode == "rollback":
+            try:
+                LockRegistry.acquire_reserved(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+                LockRegistry.acquire_exclusive(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+            except BaseException:
+                LockRegistry.downgrade_to_shared(self.path, self.connection_id)
+                raise
+            return
+
+        LockRegistry.acquire_wal_writer(
+            self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+        )
+        if (
+            self._snapshot_wal_signature is not None
+            and self.pager.wal_signature() != self._snapshot_wal_signature
+        ):
+            LockRegistry.downgrade_to_shared(self.path, self.connection_id)
+            raise BusySnapshotError(
+                "WAL snapshot is stale; rollback and retry the write transaction"
+            )
+
     def begin(self) -> None:
-        self.tx.begin()
+        if self.in_transaction:
+            self.tx.begin()
+            return
+        self._acquire_shared_snapshot()
+        try:
+            self.tx.begin()
+        except BaseException:
+            LockRegistry.release_all(self.path, self.connection_id)
+            self._snapshot_wal_signature = None
+            raise
 
     def commit(self) -> None:
         self.tx.commit()
+        LockRegistry.release_all(self.path, self.connection_id)
+        self._snapshot_wal_signature = None
 
     def rollback(self) -> None:
-        self.tx.rollback()
-        # Catalog/meta objects may have been changed by CREATE TABLE or a B+Tree
-        # root split. Rebuild them from the restored page cache after rollback.
-        self._reload_runtime()
+        try:
+            self.tx.rollback()
+            self._reload_runtime()
+        finally:
+            LockRegistry.release_all(self.path, self.connection_id)
+            self._snapshot_wal_signature = None
 
     @contextmanager
     def transaction(self) -> Iterator["Database"]:
@@ -111,9 +208,22 @@ class Database:
         else:
             self.commit()
 
+    def _execute_planned(self, stmt, *, autocommit_write: bool) -> QueryResult:
+        plan = self.planner.plan(stmt)
+        code = self.compiler.compile(plan)
+        self._last_code = code
+        self._last_explain = self.planner.explain(plan)
+        vm_result = self.vm.execute(code)
+        if autocommit_write:
+            self.commit()
+        columns: list[str] = []
+        projection_names = getattr(plan, "projection_names", None)
+        if projection_names is not None:
+            columns = list(projection_names)
+        return QueryResult(vm_result.rows, columns, vm_result.rowcount)
+
     def execute(self, sql: str) -> QueryResult:
         stmt = Parser(sql).parse()
-
         if isinstance(stmt, BeginStmt):
             self.begin()
             return QueryResult([], [], 0)
@@ -124,48 +234,59 @@ class Database:
             self.rollback()
             return QueryResult([], [], 0)
 
-        plan = self.planner.plan(stmt)
-        code = self.compiler.compile(plan)
-        self._last_code = code
-        self._last_explain = self.planner.explain(plan)
+        read_only = isinstance(stmt, SelectStmtAst)
+        if read_only and not self.in_transaction:
+            self._acquire_shared_snapshot()
+            try:
+                return self._execute_planned(stmt, autocommit_write=False)
+            finally:
+                LockRegistry.release_all(self.path, self.connection_id)
+                self._snapshot_wal_signature = None
 
-        # Read-only statements need no rollback journal in autocommit mode.
-        # Any write statement outside BEGIN gets its own durable transaction.
-        autocommit_write = not self.in_transaction and not isinstance(plan, (SelectPlan, JoinSelectPlan))
-        if autocommit_write:
-            self.begin()
-
+        autocommit_write = not read_only and not self.in_transaction
         try:
-            vm_result = self.vm.execute(code)
             if autocommit_write:
-                self.commit()
+                self._acquire_autocommit_write()
+                self.tx.begin()
+            elif not read_only:
+                self._upgrade_explicit_write()
+            return self._execute_planned(stmt, autocommit_write=autocommit_write)
         except BaseException:
-            # v0.2+ chooses a simple, safe policy: execution failure aborts the
-            # whole active transaction rather than implementing statement savepoints.
             if self.in_transaction:
                 self.rollback()
+            elif autocommit_write:
+                LockRegistry.release_all(self.path, self.connection_id)
+                self._snapshot_wal_signature = None
             raise
 
-        columns: list[str] = []
-        projection_names = getattr(plan, "projection_names", None)
-        if projection_names is not None:
-            columns = list(projection_names)
-        return QueryResult(vm_result.rows, columns, vm_result.rowcount)
+    @contextmanager
+    def _metadata_snapshot(self) -> Iterator[None]:
+        if self.in_transaction:
+            yield
+            return
+        self._acquire_shared_snapshot()
+        try:
+            yield
+        finally:
+            LockRegistry.release_all(self.path, self.connection_id)
+            self._snapshot_wal_signature = None
 
     def explain(self, sql: str) -> str:
         stmt = Parser(sql).parse()
         if isinstance(stmt, (BeginStmt, CommitStmt, RollbackStmt)):
             return type(stmt).__name__.removesuffix("Stmt").upper()
-        plan = self.planner.plan(stmt)
-        return self.planner.explain(plan)
+        with self._metadata_snapshot():
+            plan = self.planner.plan(stmt)
+            return self.planner.explain(plan)
 
     def bytecode(self, sql: str | None = None) -> str:
         if sql is not None:
             stmt = Parser(sql).parse()
             if isinstance(stmt, (BeginStmt, CommitStmt, RollbackStmt)):
                 return "transaction control is handled by the connection, not the VM"
-            plan = self.planner.plan(stmt)
-            code = self.compiler.compile(plan)
+            with self._metadata_snapshot():
+                plan = self.planner.plan(stmt)
+                code = self.compiler.compile(plan)
         else:
             code = self._last_code
         return self.compiler.disassemble(code)
@@ -179,9 +300,7 @@ class Database:
                 cols.append(f"{col.name} {col.type.value}{suffix}")
             chunks.append(f"CREATE TABLE {table.name} ({', '.join(cols)});")
             for index in table.indexes:
-                chunks.append(
-                    f"CREATE INDEX {index.name} ON {table.name}({index.column});"
-                )
+                chunks.append(f"CREATE INDEX {index.name} ON {table.name}({index.column});")
         return "\n".join(chunks)
 
     def indexes_text(self) -> str:
@@ -193,18 +312,15 @@ class Database:
 
     def btree_dump(self, table_name: str) -> str:
         schema = self.catalog.get_table(table_name)
-        tree = BTree(self.pager, schema.root_page)
-        return tree.dump()
+        return BTree(self.pager, schema.root_page).dump()
 
     def index_dump(self, index_name: str) -> str:
         _table, schema = self.catalog.get_index(index_name)
-        tree = ByteKeyBTree(self.pager, schema.root_page)
-        return tree.dump()
+        return ByteKeyBTree(self.pager, schema.root_page).dump()
 
     def pages_text(self) -> str:
         from mini_sqlite.btree.node import BTreeNode
         from mini_sqlite.index.node import IndexNode
-
         lines = ["PAGE  TYPE          CELLS  PARENT  RIGHT"]
         lines.append(f"{0:>4}  {'META':<13} {'-':>5}  {'-':>6}  {'-':>5}")
         for page_id in range(1, self.pager.page_count):
@@ -218,14 +334,9 @@ class Database:
                     node = IndexNode.decode(page_id, raw_copy)
                     kind = f"IDX_{node.node_type.name}"
                 except Exception:
-                    lines.append(
-                        f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}"
-                    )
+                    lines.append(f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}")
                     continue
-            lines.append(
-                f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  "
-                f"{node.parent:>6}  {node.right_sibling:>5}"
-            )
+            lines.append(f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  {node.parent:>6}  {node.right_sibling:>5}")
         return "\n".join(lines)
 
     def buffer_status(self) -> str:
@@ -252,15 +363,17 @@ class Database:
         stats = self.pager.stats()
         if self.pager.journal_mode == "wal":
             wal = self.pager.wal_stats()
+            lock = LockRegistry.snapshot(self.path, self.connection_id)["my_lock"]
             return (
-                f"state={self.tx.state.value} mode=wal wal={self.pager.wal_path.name} "
-                f"dirty_pages={stats['transaction_dirty_pages']} "
+                f"state={self.tx.state.value} mode=wal lock={lock} "
+                f"wal={self.pager.wal_path.name} dirty_pages={stats['transaction_dirty_pages']} "
                 f"committed_frames={wal['committed_frames']} "
                 f"recovered_on_open={stats['recovery_performed']}"
             )
+        lock = LockRegistry.snapshot(self.path, self.connection_id)["my_lock"]
         return (
-            f"state={self.tx.state.value} mode=rollback journal={self.pager.journal_path.name} "
-            f"journaled_pages={stats['journaled_pages']} "
+            f"state={self.tx.state.value} mode=rollback lock={lock} "
+            f"journal={self.pager.journal_path.name} journaled_pages={stats['journaled_pages']} "
             f"recovered_on_open={stats['recovery_performed']}"
         )
 
@@ -274,23 +387,42 @@ class Database:
         )
 
     def checkpoint(self) -> int:
-        return self.pager.checkpoint()
+        if self.in_transaction:
+            return self.pager.checkpoint()
+        if self.pager.journal_mode != "wal":
+            return self.pager.checkpoint()
+        LockRegistry.acquire_checkpoint(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+        try:
+            self._refresh_view()
+            return self.pager.checkpoint()
+        finally:
+            LockRegistry.release_all(self.path, self.connection_id)
+
+    def lock_status(self) -> str:
+        state = LockRegistry.snapshot(self.path, self.connection_id)
+        return (
+            f"connection={state['connection_id']} mode={state['journal_mode']} "
+            f"mine={state['my_lock']} connections={state['connections']} "
+            f"readers={state['shared_readers']} reserved={state['reserved_holder']} "
+            f"exclusive={state['exclusive_holder']} wal_writer={state['wal_writer']} "
+            f"busy_timeout_ms={self.busy_timeout_ms}"
+        )
 
     def flush(self) -> None:
-        """Flush what the active durability mode safely permits.
-
-        Rollback mode may write transaction-local pages because the before-image
-        journal can undo them. WAL mode deliberately keeps uncommitted dirty pages
-        out of the main database file; commit appends them to the WAL instead.
-        """
         self.pager.flush_all()
 
     def close(self) -> None:
-        # TransactionManager mirrors Pager state; close must preserve "uncommitted
-        # means rolled back" semantics while leaving no stale manager state.
-        if self.in_transaction:
-            self.rollback()
-        self.pager.close()
+        if not getattr(self, "_registered", False):
+            return
+        try:
+            if self.in_transaction:
+                self.rollback()
+            else:
+                LockRegistry.release_all(self.path, self.connection_id)
+            self.pager.close()
+        finally:
+            LockRegistry.unregister(self.path, self.connection_id)
+            self._registered = False
 
     def __enter__(self) -> "Database":
         return self

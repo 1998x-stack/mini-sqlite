@@ -32,6 +32,7 @@ class Pager:
         journal_mode: str = "rollback",
         buffer_pages: int = 64,
         replacement_policy: str = "clock",
+        recover: bool = True,
     ):
         self.path = Path(path)
         self.page_size = page_size
@@ -50,9 +51,11 @@ class Pager:
         self._transaction_dirty_pages: set[int] = set()
         self._wal_before_images: dict[int, bytes] = {}
 
-        rollback_recovery = RollbackJournal.recover_if_hot(
-            self.path, self._file, expected_page_size=self.page_size
-        )
+        rollback_recovery = False
+        if recover:
+            rollback_recovery = RollbackJournal.recover_if_hot(
+                self.path, self._file, expected_page_size=self.page_size
+            )
 
         self._file.seek(0, os.SEEK_END)
         size = self._file.tell()
@@ -63,17 +66,21 @@ class Pager:
         self._wal: WriteAheadLog | None = None
         wal_recovery = False
         if self.journal_mode == "wal":
-            self._wal = WriteAheadLog(self.path, page_size=self.page_size)
+            self._wal = WriteAheadLog(
+                self.path, page_size=self.page_size, recover_tail=recover
+            )
             wal_recovery = self._wal.recovery_performed
             wal_count = self._wal.page_count or 0
             self._page_count = max(self._database_page_count, wal_count)
         else:
-            wal_recovery = WriteAheadLog.checkpoint_existing_into_database(
-                self.path,
-                self._file,
-                expected_page_size=self.page_size,
-                database_page_count=self._database_page_count,
-            )
+            wal_recovery = False
+            if recover:
+                wal_recovery = WriteAheadLog.checkpoint_existing_into_database(
+                    self.path,
+                    self._file,
+                    expected_page_size=self.page_size,
+                    database_page_count=self._database_page_count,
+                )
             if wal_recovery:
                 self._file.seek(0, os.SEEK_END)
                 self._database_page_count = self._file.tell() // self.page_size
@@ -102,6 +109,37 @@ class Pager:
     def wal_path(self) -> Path:
         return WriteAheadLog.path_for(self.path)
 
+    def wal_signature(self) -> tuple[int, int]:
+        if self._wal is None:
+            return (0, 0)
+        return self._wal.disk_signature()
+
+    def refresh_from_disk(self) -> None:
+        """Discard the idle connection cache and observe newest committed state.
+
+        The caller must already hold the connection-level lock appropriate for
+        its durability mode. v0.9 uses this before starting a new statement or
+        transaction snapshot. Active transactions deliberately cannot refresh: a
+        transaction owns one stable logical view until COMMIT/ROLLBACK.
+        """
+        if self.in_transaction:
+            raise TransactionError("cannot refresh Pager during an active transaction")
+        stats = self.buffer.stats()
+        if stats["dirty"]:
+            raise StorageError("cannot refresh Pager with dirty idle buffer frames")
+        self.buffer.clear()
+        self._file.seek(0, os.SEEK_END)
+        size = self._file.tell()
+        if size % self.page_size != 0:
+            raise StorageError(f"database file size {size} is not page aligned")
+        self._database_page_count = size // self.page_size
+        if self._wal is not None:
+            self._wal.refresh()
+            wal_count = self._wal.page_count or 0
+            self._page_count = max(self._database_page_count, wal_count)
+        else:
+            self._page_count = self._database_page_count
+
     def _load_page_bytes(self, page_id: int) -> bytes:
         raw: bytes | None = None
         if self._wal is not None:
@@ -121,18 +159,12 @@ class Pager:
     def _can_evict_frame(self, frame: BufferFrame) -> bool:
         if not frame.dirty:
             return True
-        # Uncommitted WAL after-images cannot leak into the database file. v0.7
-        # therefore keeps those frames resident until COMMIT/ROLLBACK. This gives
-        # a visible transaction-working-set limit rather than silently weakening
-        # WAL atomicity.
         if (
             self.journal_mode == "wal"
             and self.in_transaction
             and frame.page_id in self._transaction_dirty_pages
         ):
             return False
-        # Rollback-journal dirty pages are evictable: _evict_frame() first syncs
-        # their before-image journal and only then writes the main database page.
         return True
 
     def _evict_frame(self, frame: BufferFrame) -> None:
@@ -140,13 +172,6 @@ class Pager:
             self.flush_page(frame.page_id)
 
     def get_page(self, page_id: int) -> bytearray:
-        """Return a transient page buffer.
-
-        Callers that keep the bytearray while doing additional page fetches should
-        use :meth:`pin_page`. Most engine code decodes immediately and can use this
-        compatibility API safely.
-        """
-
         if page_id < 0 or page_id >= self._page_count:
             raise StorageError(f"page {page_id} out of range; count={self._page_count}")
         frame = self.buffer.fetch(
@@ -174,6 +199,8 @@ class Pager:
             self.buffer.unpin(page_id)
 
     def allocate_page(self) -> int:
+        if self.in_transaction and self.journal_mode == "rollback":
+            self._ensure_rollback_journal()
         page_id = self._page_count
         self._page_count += 1
         try:
@@ -205,12 +232,11 @@ class Pager:
             dirty=True,
             can_evict=self._can_evict_frame,
             on_evict=self._evict_frame,
-         )
+        )
         if self.in_transaction:
             self._transaction_dirty_pages.add(page_id)
 
     def mark_dirty(self, page_id: int) -> None:
-        # Call mark_dirty *before* mutating a buffer returned by get_page().
         self._capture_before_image(page_id)
         if page_id not in self.buffer:
             self.get_page(page_id)
@@ -218,25 +244,37 @@ class Pager:
         if self.in_transaction:
             self._transaction_dirty_pages.add(page_id)
 
+    def _ensure_rollback_journal(self) -> RollbackJournal:
+        if self.journal_mode != "rollback":
+            raise TransactionError("rollback journal requested in WAL mode")
+        if not self.in_transaction:
+            raise TransactionError("rollback journal requires an active transaction")
+        if self._journal is None:
+            assert self._transaction_original_page_count is not None
+            self._journal = RollbackJournal.create(
+                self.path,
+                page_size=self.page_size,
+                original_page_count=self._transaction_original_page_count,
+            )
+        return self._journal
+
     def _capture_before_image(self, page_id: int) -> None:
         if not self.in_transaction:
             return
         assert self._transaction_original_page_count is not None
         if page_id >= self._transaction_original_page_count:
             return
-
         if self.journal_mode == "wal":
             if page_id not in self._wal_before_images:
                 with self.pin_page(page_id) as page:
                     self._wal_before_images[page_id] = bytes(page)
             return
-
         if page_id in self._journaled_pages:
             return
-        assert self._journal is not None
+        journal = self._ensure_rollback_journal()
         with self.pin_page(page_id) as page:
             before = bytes(page)
-        self._journal.append_before_image(page_id, before)
+        journal.append_before_image(page_id, before)
         self._journaled_pages.add(page_id)
         self._journal_needs_sync = True
 
@@ -246,14 +284,7 @@ class Pager:
         self._transaction_original_page_count = self._page_count
         self._transaction_dirty_pages.clear()
         self._wal_before_images.clear()
-        if self.journal_mode == "rollback":
-            self._journal = RollbackJournal.create(
-                self.path,
-                page_size=self.page_size,
-                original_page_count=self._page_count,
-            )
-        else:
-            self._journal = None
+        self._journal = None
         self._journaled_pages.clear()
         self._journal_needs_sync = False
 
@@ -265,7 +296,6 @@ class Pager:
     def commit_transaction(self) -> None:
         if not self.in_transaction:
             raise TransactionError("cannot commit without an active pager transaction")
-
         if self.journal_mode == "wal":
             assert self._wal is not None
             frames: list[tuple[int, bytes]] = []
@@ -282,8 +312,9 @@ class Pager:
                     self.buffer.mark_clean(page_id)
             self._clear_transaction_state()
             return
-
-        assert self._journal is not None
+        if self._journal is None:
+            self._clear_transaction_state()
+            return
         self._sync_journal_if_needed()
         self.flush_all(sync=True)
         self._journal.delete()
@@ -294,7 +325,6 @@ class Pager:
         if not self.in_transaction:
             raise TransactionError("cannot rollback without an active pager transaction")
         assert self._transaction_original_page_count is not None
-
         if self.journal_mode == "wal":
             original_count = self._transaction_original_page_count
             for page_id, before in self._wal_before_images.items():
@@ -311,8 +341,9 @@ class Pager:
             self._page_count = original_count
             self._clear_transaction_state()
             return
-
-        assert self._journal is not None
+        if self._journal is None:
+            self._clear_transaction_state()
+            return
         original_count = self._journal.original_page_count
         self._journal.restore_into(self._file)
         self.buffer.clear()
@@ -354,8 +385,6 @@ class Pager:
             os.fsync(self._file.fileno())
 
     def clear_cache(self) -> None:
-        """Flush durability-safe dirty pages and remove every unpinned frame."""
-
         self.flush_all()
         self.buffer.clear()
 
