@@ -1,5 +1,20 @@
 # mini-sqlite
 
+## v1.1 — Cross-process File Locking
+
+v1.1 extends the v0.9 lock state machine to independent Python processes using POSIX `flock` sidecars. Rollback readers/writers, WAL single-writer semantics, checkpoint exclusion, busy timeout, journal-mode agreement, abrupt-process lock release, and VACUUM exclusivity now work across processes. See `docs/CROSS_PROCESS_LOCKING.md` and `examples/cross_process.py`.
+
+```text
+LockRegistry (process-local semantics)
+        ↓
+FileLockSet (POSIX flock)
+        ↓
+MODE / PENDING / READERS / WRITER
+        ↓
+Pager + rollback/WAL
+```
+
+
 A Python-first, SQLite-inspired educational database engine built as a sequence of architectural milestones. It is **not** a wrapper around Python `sqlite3`, and it is **not** SQLite file-format compatible.
 
 ## v1.0 — Educationally Complete
@@ -45,7 +60,8 @@ v0.6  WAL + Read Overlay + Checkpoint
 v0.7  Bounded Buffer Manager + LRU/CLOCK
 v0.8  ANALYZE + Cost-Based Optimizer
 v0.9  Multi-Connection Concurrency + Locks
-v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE   ← current
+v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE
+v1.1  Cross-process File Locking                       ← current
 ```
 
 ## Quick start
@@ -102,7 +118,7 @@ result = db.vacuum()
 print(result.render())
 ```
 
-VACUUM rebuilds the logical database into a private compact file, recreates indexes/statistics, and atomically replaces the old file. It requires this `Database` object to be the only live process-local connection so peers cannot retain descriptors to the old inode.
+VACUUM rebuilds the logical database into a private compact file, recreates indexes/statistics, and atomically replaces the old file. In v1.1 it also requires global OS-level exclusivity so another process cannot keep a live reader snapshot while the inode is replaced.
 
 ### EXPLAIN ANALYZE
 
@@ -156,7 +172,7 @@ Database(
 )
 ```
 
-v0.9 locking is process-local: multiple `Database` objects in one Python process coordinate correctly, but v1.0 still does not claim cross-process OS locking.
+v1.1 mirrors the process-local lock state machine into POSIX `flock`, so independent Python processes coordinate rollback readers/writers, WAL readers/single-writer, checkpoint, mode agreement, and busy timeout. See `docs/CROSS_PROCESS_LOCKING.md`.
 
 ## CLI
 
@@ -201,6 +217,7 @@ python examples/buffer_pool.py
 python examples/optimizer.py
 python examples/concurrency.py
 python examples/lifecycle.py
+python examples/cross_process.py
 python -m compileall -q mini_sqlite
 ```
 
@@ -214,21 +231,21 @@ It compares only mini-sqlite plans with each other; it is not a benchmark agains
 
 ## Recommended reading order
 
-Start with [`docs/LEARNING_PATH.md`](docs/LEARNING_PATH.md). For v1.0 maintenance read:
+Start with [`docs/LEARNING_PATH.md`](docs/LEARNING_PATH.md). For v1.1 locking read:
 
-1. `docs/MAINTENANCE.md`
-2. `mini_sqlite/maintenance/integrity.py`
-3. `Database.reindex()` / `Database.vacuum()` / `Database.explain_analyze()`
-4. `tests/test_maintenance.py`
-5. `examples/lifecycle.py`
+1. `docs/CROSS_PROCESS_LOCKING.md`
+2. `mini_sqlite/concurrency/file_lock.py`
+3. `mini_sqlite/concurrency/lock.py`
+4. `tests/test_cross_process_locking.py`
+5. `examples/cross_process.py`
 
-For persistence and failure semantics see `docs/COMPATIBILITY.md` and `docs/FAULT_MATRIX.md`.
+For lifecycle maintenance read `docs/MAINTENANCE.md`; for persistence/failure semantics see `docs/COMPATIBILITY.md` and `docs/FAULT_MATRIX.md`.
 
 ## Explicit non-goals
 
 - SQLite binary file-format compatibility;
 - SQL feature parity;
-- cross-process production locking;
+- Windows cross-process locking in v1.1;
 - MVCC / multi-writer WAL;
 - savepoints and nested transactions;
 - production-calibrated optimizer costs;

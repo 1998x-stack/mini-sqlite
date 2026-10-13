@@ -11,3 +11,7 @@ dist/
 *-journal
 
 *-wal
+*-lock-mode
+*-lock-pending
+*-lock-readers
+*-lock-writer

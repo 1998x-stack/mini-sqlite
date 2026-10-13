@@ -1,174 +1,100 @@
-# Agents.md — mini-sqlite Development Contract
+# Agents.md — mini-sqlite v1.1 Development Contract
 
-> **Mandatory for future work:** read this file before changing code, tests, documentation, branches, storage formats, durability, planning, concurrency, or maintenance semantics.
->
-> `main` is the canonical integrated state. Historical version branches are frozen learning snapshots.
+> Frozen learning snapshot. Read this file before changing v1.1 locking, recovery, maintenance, tests, or documentation.
 
-## 1. Repository mission
+## 1. Version mission
 
-mini-sqlite is a Python-first educational database engine for understanding the mechanisms behind SQLite-style systems.
+v1.1 adds one dominant mental model:
 
-Priorities:
+> **A database lock is only cross-process when the operating system can see it.**
 
-```text
-architectural clarity
-      ↓
-correctness + explicit invariants
-      ↓
-readable reference implementation
-      ↓
-mechanism-focused tests
-      ↓
-observable end-to-end behavior
-      ↓
-performance / SQL breadth later
-```
+The existing connection state machine remains; POSIX `flock` sidecars mirror it across independent Python interpreters.
 
-It is not intended to provide SQLite binary compatibility or production database guarantees.
+## 2. Mandatory reading order
 
-## 2. Integrated v1.0 architecture
+1. `Agents.md`
+2. `version.md`
+3. `docs/CROSS_PROCESS_LOCKING.md`
+4. `docs/CONCURRENCY.md`
+5. `mini_sqlite/concurrency/file_lock.py`
+6. `mini_sqlite/concurrency/lock.py`
+7. `tests/test_cross_process_locking.py`
+8. `examples/cross_process.py`
+9. `docs/TRANSACTIONS.md`
+10. `docs/WAL.md`
 
-```text
-SQL / Parser / AST
-        ↓
-Cost-Based Planner ← ANALYZE statistics
-        ↓
-Compiler / Tiny VM
-        ↓
-Relational operators / JOIN
-        ↓
-Table + Secondary-Index B+Trees
-        ↓
-Database connection / Lock Registry
-        ↓
-Pager
-        ↓
-Bounded Buffer Manager (LRU / CLOCK)
-        ↓
-Rollback Journal OR WAL
-        ↓
-Database file
+## 3. Branch boundary
 
-Lifecycle layer:
- integrity_check · reindex · vacuum · explain_analyze
-```
+This branch is the frozen **v1.1 cross-process-locking milestone**.
 
-Every subsystem must remain at its narrowest useful boundary. Planner choices must not change storage correctness; cache replacement must not bypass durability; maintenance must use normal storage/transaction APIs rather than editing page bytes ad hoc.
+Do not backport v1.2 free-list page reuse, v1.3 range/composite indexes, savepoints, hash/merge join, MVCC, or a Windows locking backend.
 
-## 3. Version history
+## 4. Layering invariant
 
 ```text
-v0.1  Page/Pager/B+Tree + SQL/Planner/VM
-v0.2  Rollback Journal + Transactions + Crash Recovery
-v0.3  Secondary Index
-v0.4  Relational Execution + UPDATE
-v0.5  INNER JOIN + Indexed Nested Loop
-v0.6  WAL + Read Overlay + Checkpoint
-v0.7  Bounded Buffer Manager + LRU/CLOCK
-v0.8  ANALYZE + Cost-Based Optimizer
-v0.9  Multi-Connection Concurrency + Locks/Snapshots
-v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE        ✅ integrated core
+Database connection
+      ↓
+LockRegistry                 readable process-local state machine
+      ↓
+FileLockSet                  POSIX flock mirror
+      ↓
+MODE / PENDING / READERS / WRITER sidecars
+      ↓
+Pager / rollback / WAL       unchanged storage protocols
 ```
 
-v1.0 is the educationally-complete core. Future releases are optional extension tracks rather than missing prerequisites.
+B+Trees, indexes, Planner, VM, Buffer Manager, rollback journal, and WAL must not parse or manipulate lock files.
 
-## 4. Branch invariant
+## 5. Cross-process invariants
 
-```text
-validated main
-   ↓
-create vX.Y
-   ↓
-implement one dominant mental model
-   ↓
-tests + docs + example
-   ↓
-exact version branch-head CI green
-   ↓
-freeze version branch
-   ↓
-integrate the same validated engine tree into main
-   ↓
-restore canonical main Agents.md / version.md
-```
+- lock-file existence is never a liveness signal;
+- every live connection holds MODE-SH after construction;
+- globally first opener owns MODE-EX through recovery/bootstrap;
+- live processes must agree on rollback vs WAL mode;
+- rollback readers hold READERS-SH;
+- one rollback RESERVED writer holds WRITER-EX;
+- rollback EXCLUSIVE owns WRITER-EX + PENDING-EX + READERS-EX;
+- WAL readers and the one WAL writer may coexist;
+- checkpoint owns WRITER-EX + PENDING-EX + READERS-EX;
+- PENDING blocks new readers while a writer/checkpoint drains old readers;
+- `busy_timeout_ms=0` fails immediately; positive values use a monotonic deadline;
+- process death releases kernel locks automatically;
+- failed partial lock acquisition must release/downgrade every lock it obtained.
 
-Never claim a version is frozen from local tests alone.
+## 6. Recovery invariant
 
-## 5. Core invariants
+Only the globally first opener may perform hot-journal/WAL recovery. MODE-EX is held until Pager recovery/bootstrap and runtime installation finish.
 
-- SQL frontend never accesses page bytes directly.
-- Planner performs no OS I/O.
-- VM talks to cursors/storage abstractions, not files.
-- B+Trees obtain and mutate pages only through Pager.
-- Pager owns durability ordering.
-- Buffer Manager owns residency/replacement, not durability.
-- pinned frames are never evicted.
-- rollback before-images must become durable before unsafe DB-page writeback.
-- uncommitted WAL dirty frames never leak into the main DB.
-- WAL reads use only complete committed prefixes.
-- connection locking lives above storage structures.
-- schema/index/statistics metadata is persisted through Catalog.
-- root page ids are mutable and owners persist root changes.
-- integrity checking is read-only.
-- REINDEX repairs derived index state through ordinary transactions.
-- VACUUM rebuilds through normal engine APIs and requires exclusive process-local connection ownership.
+In rollback mode a constructor also holds a temporary READERS-SH guard so it cannot inspect main-file bytes while another process owns EXCLUSIVE.
 
-## 6. Compatibility rule
+## 7. Durability invariant
 
-Any future incompatible page, record, catalog, rollback-journal, WAL, or index byte-layout change requires an explicit new version, format documentation, reopen/corruption tests, and a compatibility or migration statement.
+v1.1 changes **no database, rollback-journal, or WAL bytes**. Lock sidecars are advisory coordination metadata, not part of the database format and not required for crash recovery after all processes exit.
 
-v1.0 itself does not change the binary formats established by earlier milestones.
+## 8. Platform boundary
 
-## 7. Testing contract
+v1.1 supports POSIX `flock` on macOS/Linux. A future Windows backend must preserve the same `FileLockSet` semantics rather than leaking platform calls into `Database` or Pager.
 
-Full core regression:
+## 9. Tests required for changes
+
+Run:
 
 ```bash
 python -m pytest -q
-python examples/quickstart.py
-python examples/transactions.py
-python examples/indexes.py
-python examples/relational.py
-python examples/joins.py
-python examples/wal.py
-python examples/buffer_pool.py
-python examples/optimizer.py
-python examples/concurrency.py
-python examples/lifecycle.py
+python examples/cross_process.py
 python -m compileall -q mini_sqlite
 ```
 
-`examples/benchmark.py` is illustrative only and is not a production benchmark.
+Any locking change must preserve all historical tests plus cross-process spawn tests. Crash tests must include abrupt process exit, not only graceful `close()`.
 
-For new mechanisms include happy paths, invariants, errors, reopen/persistence checks, access-path diagnostics, concurrency/fault/crash cases where relevant, and one educational example.
+## 10. Definition of done
 
-## 8. Documentation contract
+A v1.1 fix is complete only when:
 
-Review when architecture/public behavior changes:
-
-```text
-Agents.md
-Plan.md
-version.md
-README.md
-relevant docs/*
-relevant tests/examples
-```
-
-## 9. Stable v1.0 non-goals
-
-- SQLite file/API parity;
-- cross-process OS locking;
-- MVCC or multi-writer WAL;
-- savepoints;
-- online/incremental VACUUM;
-- free-list page reuse;
-- production cost calibration;
-- query parallelism;
-- production security/performance guarantees.
-
-## 10. Post-1.0 extensions
-
-Optional directions are documented in `Plan.md`, including cross-process locking, free-list reuse, range/composite indexes, savepoints, additional join algorithms, and an MVCC experiment.
-
-Each must be a distinct version with one dominant mental model; do not blur them into the frozen v1.0 branch.
+1. process-local and cross-process lock state agree;
+2. rollback and WAL conflict matrices remain correct;
+3. busy timeout and failure cleanup are deterministic;
+4. crash recovery works after abrupt process death;
+5. v1.0 maintenance remains safe;
+6. exact branch-head CI is green on supported Python versions;
+7. documentation matches actual lock ordering.

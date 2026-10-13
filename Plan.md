@@ -1,89 +1,62 @@
-# mini-sqlite — Architecture-Driven Development Plan
+# mini-sqlite Roadmap
 
-## Completed core track
+## Completed learning spine
 
 ```text
-v0.1  Pages / Pager / primary B+Tree / SQL -> VM                 ✅
-v0.2  Rollback journal / transactions / crash recovery           ✅
-v0.3  Secondary indexes / richer access paths                    ✅
-v0.4  Relational execution / UPDATE / sort / aggregate           ✅
-v0.5  INNER JOIN / indexed nested loop                           ✅
-v0.6  WAL / committed overlay / checkpoint                       ✅
-v0.7  Bounded buffer manager / LRU / CLOCK                       ✅
-v0.8  ANALYZE / statistics / cost-based optimizer                ✅
-v0.9  Multi-connection concurrency / locks / snapshots           ✅
-v1.0  Integrity / REINDEX / VACUUM / end-to-end diagnostics      ✅
+v0.1  Page / Pager / B+Tree / SQL / VM
+v0.2  Rollback Journal / Transaction / Recovery
+v0.3  Secondary Index
+v0.4  Relational Execution
+v0.5  JOIN
+v0.6  WAL
+v0.7  Bounded Buffer Manager
+v0.8  Cost-Based Optimizer
+v0.9  Process-local Concurrency / Locking
+v1.0  Integrity / REINDEX / VACUUM / Diagnostics
+v1.1  Cross-process File Locking                     ← current
 ```
 
-## v1.0 completion criterion
+## v1.1 — Cross-process File Locking
 
-A learner can now follow and inspect one coherent lifecycle:
+Goal: make the v0.9 lock state machine real across independent Python processes without changing storage formats.
 
-```text
-SQL
- ↓
-parse / bind
- ↓
-plan + cost
- ↓
-bytecode / execution
- ↓
-row / index B+Trees
- ↓
-buffer pool
- ↓
-rollback or WAL durability
- ↓
-connection locks / snapshots
- ↓
-integrity check / reindex / vacuum
-```
+Deliverables:
 
-v1.0 adds no new on-disk page/journal/WAL format. Its dominant mental model is **database lifecycle completeness**: build data structures, execute them, recover them, inspect them, detect inconsistency, repair derived structures, and compact abandoned pages.
+- POSIX `flock` abstraction;
+- MODE agreement/recovery ownership;
+- rollback reader/writer/PENDING protocol;
+- WAL global single writer + concurrent readers;
+- checkpoint global exclusion;
+- busy timeout across processes;
+- crash auto-release and recovery tests;
+- maintenance/VACUUM integration;
+- lock observability and documentation.
 
-## Stable v1.0 non-goals
+## v1.2 — Free-list Page Reuse + Incremental VACUUM
 
-- SQLite file/API parity;
-- cross-process OS locking;
-- MVCC or multi-writer WAL;
-- free-list page reuse;
-- online/incremental VACUUM;
-- savepoints;
-- hash/merge joins;
-- production cost calibration;
-- query parallelism.
+Dominant question:
 
-## Optional post-1.0 extension track
+> When a B+Tree/index stops owning a page, must the database file grow forever until full VACUUM?
 
-These are intentionally outside the educationally-complete core and should each become a separate branch if pursued:
+Planned work:
+
+- persistent free-page metadata;
+- page free/reuse API below B+Tree;
+- index rebuild returns old pages to free-list;
+- delete/merge preparation;
+- free-list integrity checks;
+- page allocation prefers reusable pages;
+- incremental vacuum/truncation when free pages reach file tail;
+- crash/rollback/WAL safety for free-list mutation;
+- `.freelist` inspection.
+
+## Later extensions
 
 ```text
-v1.1  Cross-process file locking + lock-byte protocol
-v1.2  Free-list page reuse + incremental vacuum
-v1.3  Range index scans + composite indexes
-v1.4  Savepoints / nested rollback scopes
-v1.5  Hash Join / Merge Join + broader join enumeration
+v1.3  Range Index Scan + Composite Index
+v1.4  Savepoints
+v1.5  Hash Join / Merge Join
 v2.0  MVCC experiment
 ```
 
-The v1.0 branch should remain frozen except for narrowly scoped defects and documentation corrections.
-
-## Version protocol
-
-```text
-read Agents.md / Plan.md / version.md
-        ↓
-create vX.Y from newest validated main
-        ↓
-implement one dominant mental model
-        ↓
-tests + example + docs
-        ↓
-exact version branch-head CI green
-        ↓
-freeze branch
-        ↓
-integrate same validated engine tree into main
-        ↓
-restore canonical main docs
-```
+These are extensions, not prerequisites for the v1.0 educational database core.

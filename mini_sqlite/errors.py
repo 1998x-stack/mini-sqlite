@@ -42,6 +42,12 @@ class JournalModeConflictError(BusyError):
     pass
 
 
+class CrossProcessLockError(MiniSQLiteError):
+    """The OS lock backend is unavailable or has invalid metadata."""
+
+    pass
+
+
 class DuplicateKeyError(MiniSQLiteError):
     pass
 

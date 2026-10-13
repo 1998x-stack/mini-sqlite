@@ -4,7 +4,7 @@ import os
 import time
 
 from mini_sqlite.btree import BTree
-from mini_sqlite.concurrency import LockRegistry
+from mini_sqlite.concurrency import LockRegistry, lock_paths
 from mini_sqlite.database import Database as CoreDatabase
 from mini_sqlite.errors import BusyError, SchemaError, TransactionError
 from mini_sqlite.maintenance.diagnostics import ExplainAnalyzeResult, VacuumResult
@@ -20,6 +20,13 @@ class Database(CoreDatabase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        try:
+            # v1.1: release the constructor-only rollback reader guard and
+            # downgrade globally-first MODE-EX only after Pager/runtime bootstrap.
+            LockRegistry.finish_registration(self.path, self.connection_id)
+        except BaseException:
+            super().close()
+            raise
         self._maintenance_in_progress = False
         # Rebind liveness so a same-connection VACUUM may temporarily close the
         # old Pager while atomically replacing the database file.
@@ -28,6 +35,18 @@ class Database(CoreDatabase):
             self.connection_id,
             lambda: self._registered
             and (self._maintenance_in_progress or not self.pager._file.closed),
+        )
+
+    def lock_status(self) -> str:
+        state = LockRegistry.snapshot(self.path, self.connection_id)
+        return (
+            f"connection={state['connection_id']} pid={state['pid']} "
+            f"mode={state['journal_mode']} backend={state['backend']} "
+            f"mine={state['my_lock']} connections={state['connections']} "
+            f"readers={state['shared_readers']} reserved={state['reserved_holder']} "
+            f"exclusive={state['exclusive_holder']} wal_writer={state['wal_writer']} "
+            f"os_readers={state['readers_lock']} os_writer={state['writer_lock']} "
+            f"busy_timeout_ms={self.busy_timeout_ms}"
         )
 
     def _run_maintenance_write(self, callback):
@@ -108,22 +127,30 @@ class Database(CoreDatabase):
         if state["connections"] != 1:
             raise BusyError("VACUUM requires the only live connection to the database")
 
-        if self.pager.journal_mode == "rollback":
-            LockRegistry.acquire_reserved(
-                self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
-            )
-            LockRegistry.acquire_exclusive(
-                self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
-            )
-        else:
-            LockRegistry.acquire_checkpoint(
-                self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
-            )
+        try:
+            if self.pager.journal_mode == "rollback":
+                LockRegistry.acquire_reserved(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+                LockRegistry.acquire_exclusive(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+            else:
+                LockRegistry.acquire_checkpoint(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+        except BaseException:
+            # Cross-process acquisition may fail after WRITER-EX/RESERVED was
+            # obtained but while readers are still draining. Never leak that
+            # partial lock into the next statement on this connection.
+            LockRegistry.release_all(self.path, self.connection_id)
+            raise
 
         self._maintenance_in_progress = True
         temp_path = self.path.with_name(f".{self.path.name}.vacuum-{self.connection_id}.tmp")
         temp_journal = temp_path.with_name(temp_path.name + "-journal")
         temp_wal = temp_path.with_name(temp_path.name + "-wal")
+        temp_lock_paths = lock_paths(temp_path).all()
         try:
             self._refresh_view()
             if self.pager.journal_mode == "wal":
@@ -137,7 +164,7 @@ class Database(CoreDatabase):
                 tree = BTree(self.pager, table.root_page)
                 table_payloads.append((table, list(tree.scan())))
 
-            for path in (temp_path, temp_journal, temp_wal):
+            for path in (temp_path, temp_journal, temp_wal, *temp_lock_paths):
                 if path.exists():
                     path.unlink()
 
@@ -195,6 +222,6 @@ class Database(CoreDatabase):
         finally:
             self._maintenance_in_progress = False
             LockRegistry.release_all(self.path, self.connection_id)
-            for path in (temp_path, temp_journal, temp_wal):
+            for path in (temp_path, temp_journal, temp_wal, *temp_lock_paths):
                 if path.exists():
                     path.unlink()

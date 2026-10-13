@@ -39,5 +39,7 @@ jobs:
         run: python examples/concurrency.py
       - name: Smoke lifecycle maintenance
         run: python examples/lifecycle.py
+      - name: Smoke cross-process locking
+        run: python examples/cross_process.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite
