@@ -122,6 +122,46 @@ class Catalog:
         return index_schema
 
 
+
+    def reindex(self, index_name: str | None = None) -> int:
+        """Rebuild one or every secondary index into fresh B+Tree pages.
+
+        Old index pages become unreachable and are intentionally left for VACUUM.
+        The caller owns the surrounding transaction, so a failed rebuild truncates
+        newly allocated pages and restores the previous catalog root atomically.
+        """
+        names = [index_name] if index_name is not None else [
+            index.name for _table, index in self.list_indexes()
+        ]
+        rebuilt = 0
+        for name in names:
+            table, old = self.get_index(name)
+            table_tree = BTree(self.pager, table.root_page)
+            rows = ((rowid, RecordCodec.decode(raw)) for rowid, raw in table_tree.scan())
+            replacement = IndexSchema(
+                name=old.name,
+                column=old.column,
+                root_page=0,
+                unique=old.unique,
+            )
+
+            def root_changed(root_page: int) -> None:
+                replacement.root_page = root_page
+
+            SecondaryIndex.create(
+                self.pager,
+                table,
+                replacement,
+                rows,
+                on_root_change=root_changed,
+            )
+            latest = self.get_table(table.name)
+            target = latest.get_index(old.name)
+            target.root_page = replacement.root_page
+            self._save_table(latest)
+            rebuilt += 1
+        return rebuilt
+
     def analyze(self, table_name: str | None = None) -> int:
         """Collect exact statistics and persist them in catalog rows.
 

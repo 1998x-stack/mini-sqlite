@@ -37,5 +37,7 @@ jobs:
         run: python examples/optimizer.py
       - name: Smoke concurrency
         run: python examples/concurrency.py
+      - name: Smoke lifecycle maintenance
+        run: python examples/lifecycle.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite

@@ -1,93 +1,61 @@
-# Agents.md — mini-sqlite Development Contract
+# Agents.md — mini-sqlite v1.0 Frozen Development Contract
 
-> Canonical contract for `main`. Read before changing architecture, storage, planner, caching, durability, statistics, connection semantics, or version scope.
+> v1.0 is the educationally-complete core. Its dominant mental model is **database lifecycle integrity and maintainability across all previously built layers**.
 
-## Mission
-
-mini-sqlite is an educational, Python-first database engine. Each version introduces one dominant database mental model while preserving earlier invariants.
-
-## Branch protocol
+## 1. Preserve the architecture
 
 ```text
-latest validated main
-   ↓
-create vX.Y
-   ↓
-one dominant mechanism
-   ↓
-tests + docs + example
-   ↓
-exact branch-head CI green
-   ↓
-freeze version branch
-   ↓
-integrate same engine tree into main
-   ↓
-restore canonical main docs
+SQL / Planner / VM
+        ↓
+relational operators / JOIN
+        ↓
+Table + Index B+Trees
+        ↓
+Database + Lock Registry
+        ↓
+Pager + Buffer Manager
+        ↓
+rollback journal / WAL
+        ↓
+disk
+
+Maintenance/diagnostics observe and repair through these public boundaries;
+they must not invent a hidden second storage engine.
 ```
 
-`main` must represent the newest validated integrated state.
+## 2. Integrity-check contract
 
-## Integrated milestones
+`integrity_check()` must validate structural and logical invariants without mutating the database. It may report stale statistics and unreachable pages as warnings, but structural tree errors, invalid rows, page aliasing, and index/table disagreement are errors.
 
-```text
-v0.1  pages / B+Tree / SQL / Planner / VM
-v0.2  rollback transactions / crash recovery
-v0.3  secondary indexes
-v0.4  relational execution / UPDATE / aggregates
-v0.5  JOIN / indexed nested loop
-v0.6  WAL / overlay / checkpoint
-v0.7  bounded Buffer Manager / LRU / CLOCK
-v0.8  ANALYZE / persistent statistics / cost-based optimizer
-v0.9  multi-connection concurrency / locking / busy / snapshots  ← integrated
-v1.0  educationally complete                                  ← next
-```
+## 3. REINDEX contract
 
-## Current architecture
+REINDEX rebuilds derived index state inside ordinary transaction/durability semantics. A failed or rolled-back rebuild must leave the old index usable. Successful rebuild may leave old pages orphaned; VACUUM is responsible for reclaiming them.
 
-```text
-SQL -> Parser -> AST -> Planner
-                         │
-                  stats + CostModel
-                         ↓
-                  physical plan
-                         ↓
-                Compiler / VM
-                         ↓
-              relations / JOIN
-                         ↓
-             table/index B+Trees
-                         ↓
-                  Database connection
-                         ↓
-                    Lock Registry
-                         ↓
-                       Pager
-                         ↓
-              Bounded Buffer Manager
-                  ├─ LRU
-                  └─ CLOCK
-                         ↓
-             rollback journal or WAL
-                         ↓
-                        disk
-```
+## 4. VACUUM contract
 
-## Architecture rules
+VACUUM rewrites the logical database to a same-directory private file and atomically replaces the original. It must preserve:
 
-- SQL frontend never reads page bytes directly.
-- Planner chooses physical work but performs no file I/O.
-- B+Trees obtain logical pages only through Pager.
-- Buffer Manager decides residency; Pager decides durability legality.
-- rollback/WAL remain interchangeable policies below the same page API.
-- optimizer estimates may change performance, never correctness.
-- statistics are persisted catalog metadata and may be stale until ANALYZE.
-- locking belongs at connection/transaction boundaries, not B+Tree nodes.
-- connection cache refresh happens only under the appropriate lock and outside active transactions.
-- rollback and WAL deliberately expose different concurrency behavior.
-- current locking is process-local; do not claim cross-process safety.
+- schema and table ids as logical schema, not necessarily physical page ids;
+- every committed row;
+- secondary-index definitions and contents;
+- presence of ANALYZE statistics (recomputed exactly);
+- selected connection journal mode after reopen.
 
-## Current validation
+It must reject active transactions and multiple live process-local connections.
+
+## 5. EXPLAIN ANALYZE contract
+
+It is read-only and SELECT-only. It must report the chosen estimated plan and actual execution metrics without changing query semantics. Timing is educational/diagnostic, not a stable performance API.
+
+## 6. Compatibility contract
+
+Do not silently change the main page, rollback journal, WAL, record, catalog, or secondary-index binary formats in v1.0. Any post-1.0 format change requires a new version and explicit compatibility statement.
+
+## 7. Historical invariants remain mandatory
+
+All v0.1-v0.9 tests must remain green: crash recovery, WAL committed-prefix rules, bounded cache/pin rules, cost choices, and concurrency locks are not weakened by maintenance features.
+
+## 8. Validation
 
 ```bash
 python -m pytest -q
@@ -100,15 +68,16 @@ python examples/wal.py
 python examples/buffer_pool.py
 python examples/optimizer.py
 python examples/concurrency.py
+python examples/lifecycle.py
 python -m compileall -q mini_sqlite
 ```
 
-## Current directive
+`examples/benchmark.py` is optional and illustrative only.
 
-`main` contains the validated **v0.9 Concurrency / Locking** milestone.
+## 9. Non-goals
 
-Next: **v1.0 Educationally Complete mini SQLite**.
+No cross-process locking, online VACUUM, free-list reuse, MVCC, savepoints, multi-writer WAL, SQLite binary compatibility, or production benchmark claims.
 
-Central question:
+## 10. Frozen-branch rule
 
-> Can one coherent, inspectable project teach the full path from SQL text to physical plans, bytecode, B+Trees, pages, durability, WAL, bounded caching, statistics, and connection locking without hidden magic?
+After exact v1.0 branch-head CI is green, permit only documentation corrections, tests clarifying promised behavior, and narrowly scoped defects within v1.0 semantics. New mechanisms belong on post-1.0 extension branches.

@@ -1,36 +1,63 @@
-# Current integrated state — v0.9
+# mini-sqlite v1.0.0 — Educationally Complete
 
-`main` contains the validated v0.1-v0.9 learning stack.
+v1.0 closes the core learning loop built from v0.1 through v0.9. It adds integrity checking, index repair, physical compaction, and estimated-vs-actual execution diagnostics without changing existing database file/journal/WAL formats.
 
-## Current capabilities
+## Primary mental model
 
-- persistent 4 KiB pages and table/catalog B+Trees;
-- tokenizer/parser/AST/planner/tiny VM;
-- rollback-journal transactions and crash recovery;
-- secondary indexes and rowid lookup;
-- UPDATE, comparisons, ORDER BY, LIMIT and scalar aggregates;
-- INNER JOIN, aliases, self-join and indexed nested loops;
-- WAL after-image commits, read overlay and checkpoint;
-- bounded buffer pool with LRU/CLOCK, pinning and dirty-eviction rules;
-- `ANALYZE` statistics snapshots and cost-based access/JOIN planning;
-- multiple live process-local connections against one database path;
-- rollback SHARED/RESERVED/EXCLUSIVE lock transitions;
-- one WAL writer coexisting with reader snapshots;
-- deterministic busy timeout and stale-snapshot write rejection;
-- cache refresh under connection locks;
-- `.locks` / lock-status inspection.
+```text
+build structures
+      ↓
+execute queries
+      ↓
+make them durable
+      ↓
+coordinate connections
+      ↓
+inspect correctness
+      ↓
+repair derived indexes
+      ↓
+compact unreachable pages
+```
 
-## Latest mechanism reading order
+## New capabilities
 
-1. `docs/CONCURRENCY.md`
-2. `mini_sqlite/concurrency/lock.py`
-3. `mini_sqlite/database.py`
-4. `mini_sqlite/storage/pager.py`
-5. `mini_sqlite/storage/wal.py`
-6. `tests/test_concurrency.py`
-7. `examples/concurrency.py`
+- `Database.integrity_check()` / `.integrity`;
+- structural validation for catalog/table/index B+Trees;
+- table-row and secondary-index cross-checking;
+- stale statistics + orphan page diagnostics;
+- `Database.reindex()` / `.reindex [INDEX]`;
+- transaction-safe index rebuild;
+- `Database.vacuum()` / `.vacuum`;
+- compact logical rewrite + atomic same-filesystem replace;
+- WAL checkpoint before WAL-mode rewrite;
+- `Database.explain_analyze()` / `.explain-analyze SQL`;
+- estimated plan + actual rows/time/buffer deltas + bytecode;
+- final learning path, compatibility matrix, fault matrix, and lifecycle example;
+- optional plan/cache microbenchmark.
 
-For optimizer/storage foundations, continue with `docs/OPTIMIZER.md`, `docs/BUFFER_MANAGER.md`, `docs/WAL.md`, and `docs/TRANSACTIONS.md`.
+## Compatibility
+
+No on-disk binary format changes from v0.9. VACUUM may assign different physical page ids because it rebuilds B+Trees, but logical schema/data/index definitions are preserved.
+
+## Important files
+
+```text
+mini_sqlite/maintenance/integrity.py
+mini_sqlite/maintenance/diagnostics.py
+mini_sqlite/database.py
+mini_sqlite/catalog/catalog.py
+mini_sqlite/cli/shell.py
+
+tests/test_maintenance.py
+examples/lifecycle.py
+examples/benchmark.py
+
+docs/MAINTENANCE.md
+docs/LEARNING_PATH.md
+docs/COMPATIBILITY.md
+docs/FAULT_MATRIX.md
+```
 
 ## Validation
 
@@ -45,13 +72,10 @@ python examples/wal.py
 python examples/buffer_pool.py
 python examples/optimizer.py
 python examples/concurrency.py
+python examples/lifecycle.py
 python -m compileall -q mini_sqlite
 ```
 
-## Important concurrency scope
+## Stable limits
 
-v0.9 locking is intentionally process-local. It teaches connection-state compatibility, snapshots, busy handling, and rollback-vs-WAL differences; it does not claim cross-process OS-level locking.
-
-## Next
-
-v1.0: **Educationally Complete mini SQLite** — consolidate the architecture, add end-to-end inspection labs and benchmark scenarios, document compatibility/recovery guarantees, clean the public learning surface, and provide a final v0.1→v0.9 reading path.
+The engine remains educational: no SQLite binary compatibility, cross-process production locking, MVCC, multi-writer WAL, savepoints, free-list reuse, online VACUUM, or production-calibrated optimizer.

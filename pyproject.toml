@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-sqlite"
-version = "0.9.0"
-description = "A tiny educational SQLite-inspired engine with pages, B+Trees, transactions, indexes, joins, WAL, bounded caching, cost-based planning, and connection locking."
+version = "1.0.0"
+description = "An educational SQLite-inspired engine spanning pages, B+Trees, transactions, indexes, joins, WAL, buffering, optimization, concurrency, and maintenance diagnostics."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

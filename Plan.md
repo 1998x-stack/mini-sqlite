@@ -1,6 +1,6 @@
 # mini-sqlite — Architecture-Driven Development Plan
 
-## Completed learning milestones
+## Completed core track
 
 ```text
 v0.1  Pages / Pager / primary B+Tree / SQL -> VM                 ✅
@@ -11,49 +11,62 @@ v0.5  INNER JOIN / indexed nested loop                           ✅
 v0.6  WAL / committed overlay / checkpoint                       ✅
 v0.7  Bounded buffer manager / LRU / CLOCK                       ✅
 v0.8  ANALYZE / statistics / cost-based optimizer                ✅
-v0.9  Multi-connection concurrency / locks / busy / snapshots    ✅
+v0.9  Multi-connection concurrency / locks / snapshots           ✅
+v1.0  Integrity / REINDEX / VACUUM / end-to-end diagnostics      ✅
 ```
 
-## v0.9 mental model
+## v1.0 completion criterion
+
+A learner can now follow and inspect one coherent lifecycle:
 
 ```text
-correct crash recovery
-        +
-correct page cache
-        +
-correct optimizer
-        ≠
-correct concurrent database
-
-multiple connections
-        ↓
-lock compatibility
-        ↓
-snapshot visibility
-        ↓
-deterministic busy handling
+SQL
+ ↓
+parse / bind
+ ↓
+plan + cost
+ ↓
+bytecode / execution
+ ↓
+row / index B+Trees
+ ↓
+buffer pool
+ ↓
+rollback or WAL durability
+ ↓
+connection locks / snapshots
+ ↓
+integrity check / reindex / vacuum
 ```
 
-Rollback and WAL deliberately expose different concurrency behavior.
+v1.0 adds no new on-disk page/journal/WAL format. Its dominant mental model is **database lifecycle completeness**: build data structures, execute them, recover them, inspect them, detect inconsistency, repair derived structures, and compact abandoned pages.
 
-## Current next milestone — v1.0 Educationally Complete
+## Stable v1.0 non-goals
 
-Central question:
+- SQLite file/API parity;
+- cross-process OS locking;
+- MVCC or multi-writer WAL;
+- free-list page reuse;
+- online/incremental VACUUM;
+- savepoints;
+- hash/merge joins;
+- production cost calibration;
+- query parallelism.
 
-> Can a reader follow one coherent path from SQL text to plans, bytecode, B+Trees, pages, transactions, WAL, buffer replacement, statistics, and connection locks — and inspect each layer without hidden magic?
+## Optional post-1.0 extension track
 
-Target v1.0 work:
+These are intentionally outside the educationally-complete core and should each become a separate branch if pursued:
 
-- final cross-version architecture guide;
-- cohesive learning labs from v0.1 to v0.9;
-- end-to-end `EXPLAIN + bytecode + pages + buffer + WAL + locks` inspection scenario;
-- small reproducible benchmark suite showing scan/index/JOIN/cache effects without pretending to benchmark SQLite itself;
-- compatibility and corruption/recovery matrix;
-- cleanup of public APIs and naming;
-- final code-map and recommended reading order;
-- final full regression and CI matrix.
+```text
+v1.1  Cross-process file locking + lock-byte protocol
+v1.2  Free-list page reuse + incremental vacuum
+v1.3  Range index scans + composite indexes
+v1.4  Savepoints / nested rollback scopes
+v1.5  Hash Join / Merge Join + broader join enumeration
+v2.0  MVCC experiment
+```
 
-Explicit v1.0 non-goals: SQL feature parity with SQLite, SQLite file-format compatibility, cross-process production locking, MVCC, distributed transactions, and production-grade cost calibration.
+The v1.0 branch should remain frozen except for narrowly scoped defects and documentation corrections.
 
 ## Version protocol
 
@@ -70,7 +83,7 @@ exact version branch-head CI green
         ↓
 freeze branch
         ↓
-integrate same engine tree into main
+integrate same validated engine tree into main
         ↓
 restore canonical main docs
 ```

@@ -49,7 +49,7 @@ def repl(
     ) as db:
         recovered = " (recovery performed)" if db.pager.recovery_performed else ""
         print(
-            f"mini-sqlite v0.9.0 mode={db.pager.journal_mode} buffer={buffer_pages}/{replacement_policy}{recovered} — .help for commands"
+            f"mini-sqlite v1.0.0 mode={db.pager.journal_mode} buffer={buffer_pages}/{replacement_policy}{recovered} — .help for commands"
         )
         while True:
             try:
@@ -92,7 +92,11 @@ def _meta_command(db: Database, line: str) -> bool:
             ".frames              show resident buffer frames\n"
             ".wal                 show WAL state\n"
             ".checkpoint          checkpoint committed WAL frames\n"
+            ".integrity           run structural + logical integrity check\n"
+            ".reindex [INDEX]     rebuild one/all secondary indexes\n"
+            ".vacuum              rewrite database into a compact file\n"
             ".explain SQL         show planner access path\n"
+            ".explain-analyze SQL execute SELECT with actual metrics\n"
             ".bytecode SQL        compile and disassemble SQL\n"
             ".quit/.exit          leave the shell"
         )
@@ -112,6 +116,22 @@ def _meta_command(db: Database, line: str) -> bool:
         print(db.buffer_frames_text())
     elif cmd == ".wal":
         print(db.wal_status())
+    elif cmd == ".integrity":
+        try:
+            print(db.integrity_check().render())
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
+    elif cmd == ".reindex" and len(parts) <= 2:
+        try:
+            count = db.reindex(parts[1] if len(parts) == 2 else None)
+            print(f"rebuilt {count} index(es)")
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
+    elif cmd == ".vacuum" and len(parts) == 1:
+        try:
+            print(db.vacuum().render())
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
     elif cmd == ".checkpoint":
         try:
             copied = db.checkpoint()
@@ -131,6 +151,11 @@ def _meta_command(db: Database, line: str) -> bool:
     elif cmd == ".explain" and len(parts) > 1:
         try:
             print(db.explain(" ".join(parts[1:])))
+        except MiniSQLiteError as exc:
+            print(f"error: {exc}")
+    elif cmd == ".explain-analyze" and len(parts) > 1:
+        try:
+            print(db.explain_analyze(" ".join(parts[1:])).render())
         except MiniSQLiteError as exc:
             print(f"error: {exc}")
     elif cmd == ".bytecode" and len(parts) > 1:
