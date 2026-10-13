@@ -1,110 +1,86 @@
-# Agents.md — mini-sqlite v0.8 Frozen Development Contract
+# Agents.md — mini-sqlite Development Contract
 
-> This branch teaches one dominant mental model: **cost-based plan choice from persistent statistics**. Do not backport v0.9 concurrency mechanisms here.
+> Canonical contract for `main`. Read before changing architecture, storage, planner, caching, durability, statistics, or connection semantics.
 
-## 1. Preserved architecture
+## Mission
 
-```text
-SQL -> Parser -> AST
-          ↓
-       Planner
-          ↓
-   Cost Model / Stats
-          ↓
-      physical plan
-          ↓
-Compiler -> Bytecode -> VM
-          ↓
-Table / Index B+Trees
-          ↓
-Pager -> Buffer Manager -> rollback/WAL -> disk
-```
+mini-sqlite is an educational, Python-first database engine. Each version introduces one dominant database mental model while preserving earlier invariants.
 
-Optimizer estimates may change plan selection but never storage correctness or SQL semantics.
-
-## 2. Statistics contract
-
-`ANALYZE` is explicit. It scans data and persists a snapshot in catalog metadata.
-
-Statistics include:
+## Branch protocol
 
 ```text
-row_count
-null_count
-distinct_count
-min/max
-up to 16 most-common-value frequencies
+latest validated main
+   ↓
+create vX.Y
+   ↓
+one dominant mechanism
+   ↓
+tests + docs + example
+   ↓
+exact branch-head CI green
+   ↓
+freeze version branch
+   ↓
+integrate same engine tree into main
+   ↓
+restore canonical main docs
 ```
 
-Writes after ANALYZE may make statistics stale. Do not silently recompute them inside INSERT/UPDATE/DELETE; staleness is part of the lesson.
+`main` must represent the newest validated integrated state.
 
-## 3. Missing-stats contract
-
-When statistics are absent, preserve the historical rule planner:
+## Integrated milestones
 
 ```text
-PK equality -> PK seek
-indexed equality -> secondary-index seek
-otherwise -> table scan
+v0.1  pages / B+Tree / SQL / Planner / VM
+v0.2  rollback transactions / crash recovery
+v0.3  secondary indexes
+v0.4  relational execution / UPDATE / aggregates
+v0.5  JOIN / indexed nested loop
+v0.6  WAL / overlay / checkpoint
+v0.7  bounded Buffer Manager / LRU / CLOCK
+v0.8  ANALYZE / persistent statistics / cost-based optimizer   ← integrated
+v0.9  concurrency / locking                                    ← next
+v1.0  educationally complete
 ```
 
-Missing or poor estimates may reduce performance, never correctness.
-
-## 4. Cost-model contract
-
-Keep constants small, explicit, deterministic, and documented. Costs are abstract work units, not latency promises.
-
-Candidate enumeration and costing must be separated from SQL parsing and from B+Tree implementation.
-
-## 5. JOIN-order contract
-
-Logical SQL-left/right identity is stable even when physical outer/inner order changes.
+## Current architecture
 
 ```text
-cursor 0 = logical SQL-left
-cursor 1 = logical SQL-right
+SQL -> Parser -> AST -> Planner
+                         │
+                  stats + CostModel
+                         ↓
+                  physical plan
+                         ↓
+                Compiler / VM
+                         ↓
+              relations / JOIN
+                         ↓
+             table/index B+Trees
+                         ↓
+                       Pager
+                         ↓
+              Bounded Buffer Manager
+                  ├─ LRU
+                  └─ CLOCK
+                         ↓
+             rollback journal or WAL
+                         ↓
+                        disk
 ```
 
-`outer_side` controls iteration only. Projection, qualified names, WHERE, ORDER BY, and result tuple order must remain semantic, not physical.
+## Architecture rules
 
-## 6. Durability contract
+- SQL frontend never reads page bytes directly.
+- Planner chooses physical work but performs no file I/O.
+- B+Trees obtain logical pages only through Pager.
+- Buffer Manager decides residency; Pager decides durability legality.
+- rollback/WAL remain interchangeable policies below the same page API.
+- optimizer estimates may change performance, never correctness.
+- statistics are persisted catalog metadata and may be stale until ANALYZE.
+- future locking belongs at connection/transaction boundaries, not inside B+Tree nodes.
 
-ANALYZE modifies catalog pages and must use the same transaction/durability path as DDL:
-
-- rollback journal can undo stats changes;
-- WAL can hold committed stats before checkpoint;
-- checkpoint preserves stats;
-- Buffer Manager must not special-case optimizer metadata.
-
-## 7. Observability contract
-
-`EXPLAIN` after ANALYZE should make reasoning auditable:
-
-```text
-estimated rows
-estimated chosen cost
-candidate costs
-physical join order
-chosen access path
-```
-
-`Catalog.get_table(...).stats` exposes saved statistics.
-
-## 8. Tests
-
-Must retain full v0.1-v0.7 regression and cover:
-
-- ANALYZE parser variants;
-- persisted statistics;
-- explicit stale-stat behavior;
-- hot-value scan vs rare-value index plan flip;
-- JOIN order reversal;
-- reversed JOIN using an inner secondary index;
-- ANALYZE rollback;
-- WAL reopen/checkpoint of stats;
-- result correctness independent of physical order.
-
-Run:
+## Current validation
 
 ```bash
 python -m pytest -q
@@ -119,10 +95,12 @@ python examples/optimizer.py
 python -m compileall -q mini_sqlite
 ```
 
-## 9. Non-goals
+## Current directive
 
-No multi-way DP join optimizer, advanced histograms, multi-column stats, adaptive runtime plans, hash/merge join, parallelism, or concurrency controls.
+`main` contains the validated **v0.8 Cost-Based Optimizer** milestone.
 
-## 10. Definition of Done
+Next: **v0.9 Concurrency / Locking**.
 
-v0.8 can be frozen only when statistics are durable and inspectable, scan/index choice demonstrably flips with distribution, JOIN orientation demonstrably flips with cardinality/index access, all prior storage/durability/buffer behavior remains green, docs and examples match implementation, and the exact final v0.8 branch-head CI passes.
+Central question:
+
+> What changes when two independent connections can read or write the same database while preserving transaction isolation, rollback/WAL durability, cache coherence, and deterministic busy behavior?
