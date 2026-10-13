@@ -1,42 +1,36 @@
-# mini-sqlite v0.9.0 — Concurrency / Locking
+# Current integrated state — v0.9
 
-This frozen milestone adds explicit multi-connection lock state on top of the v0.1-v0.8 page, transaction, index, relational, JOIN, WAL, buffer-pool, and optimizer foundations.
+`main` contains the validated v0.1-v0.9 learning stack.
 
-## Primary mental model
+## Current capabilities
 
-```text
-Connection A              Connection B
-     │                          │
- transaction / statement   transaction / statement
-     │                          │
-     └────── Lock Registry ─────┘
-                   │
-           rollback or WAL rules
-                   │
-                 Pager
-```
+- persistent 4 KiB pages and table/catalog B+Trees;
+- tokenizer/parser/AST/planner/tiny VM;
+- rollback-journal transactions and crash recovery;
+- secondary indexes and rowid lookup;
+- UPDATE, comparisons, ORDER BY, LIMIT and scalar aggregates;
+- INNER JOIN, aliases, self-join and indexed nested loops;
+- WAL after-image commits, read overlay and checkpoint;
+- bounded buffer pool with LRU/CLOCK, pinning and dirty-eviction rules;
+- `ANALYZE` statistics snapshots and cost-based access/JOIN planning;
+- multiple live process-local connections against one database path;
+- rollback SHARED/RESERVED/EXCLUSIVE lock transitions;
+- one WAL writer coexisting with reader snapshots;
+- deterministic busy timeout and stale-snapshot write rejection;
+- cache refresh under connection locks;
+- `.locks` / lock-status inspection.
 
-## New capabilities
+## Latest mechanism reading order
 
-- multiple live `Database` instances against one path;
-- process-local lock registry;
-- rollback `SHARED / RESERVED / EXCLUSIVE` states;
-- lazy rollback-journal creation for read-only transactions;
-- one WAL writer coexisting with WAL readers;
-- stable explicit WAL read snapshots;
-- stale WAL read→write upgrade detection (`BusySnapshotError`);
-- deterministic `BusyError` conflicts;
-- configurable `busy_timeout_ms` wait/retry;
-- condition-variable wakeups after release;
-- connection-local Pager/buffer refresh before new snapshots;
-- checkpoint waits for explicit WAL readers;
-- live journal-mode conflict detection;
-- crash-test liveness pruning;
-- `.locks` and `Database.lock_status()` inspection.
+1. `docs/CONCURRENCY.md`
+2. `mini_sqlite/concurrency/lock.py`
+3. `mini_sqlite/database.py`
+4. `mini_sqlite/storage/pager.py`
+5. `mini_sqlite/storage/wal.py`
+6. `tests/test_concurrency.py`
+7. `examples/concurrency.py`
 
-## Compatibility
-
-The main database file, rollback-journal format, WAL format, B+Tree layout, secondary-index layout, and optimizer-statistics encoding are unchanged. Rollback journal creation is now lazy; its byte format is unchanged.
+For optimizer/storage foundations, continue with `docs/OPTIMIZER.md`, `docs/BUFFER_MANAGER.md`, `docs/WAL.md`, and `docs/TRANSACTIONS.md`.
 
 ## Validation
 
@@ -54,10 +48,10 @@ python examples/concurrency.py
 python -m compileall -q mini_sqlite
 ```
 
-## Explicit limits
+## Important concurrency scope
 
-Locking is process-local; v0.9 does not claim safe coordination between separate operating-system processes. No row locks, MVCC engine, deadlock detector, multi-writer WAL, or savepoints.
+v0.9 locking is intentionally process-local. It teaches connection-state compatibility, snapshots, busy handling, and rollback-vs-WAL differences; it does not claim cross-process OS-level locking.
 
 ## Next
 
-v1.0: **Educationally Complete mini SQLite** — consolidate invariants, end-to-end inspection labs, compatibility/recovery matrix, benchmark scenarios, and a final learning path across v0.1–v0.9.
+v1.0: **Educationally Complete mini SQLite** — consolidate the architecture, add end-to-end inspection labs and benchmark scenarios, document compatibility/recovery guarantees, clean the public learning surface, and provide a final v0.1→v0.9 reading path.
