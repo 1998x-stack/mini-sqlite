@@ -36,185 +36,177 @@ concurrency
 
 ### v0.1 — Page-backed B+Tree + SQL → Planner → VM ✅
 
-- 4 KiB Pager;
-- slotted table/catalog B+Tree;
-- search/insert/delete/scan/splits;
-- typed record codec;
-- persistent catalog;
-- tokenizer/parser/AST;
-- rule planner;
-- tiny VDBE-inspired VM;
-- PK seek vs table scan;
-- CREATE TABLE / INSERT / SELECT / DELETE.
+4 KiB Pager, slotted B+Tree, typed records, persistent catalog, Parser/AST/Planner/VM, PK seek vs scan, CREATE/INSERT/SELECT/DELETE.
 
 ### v0.2 — Rollback-journal transactions + crash recovery ✅
 
-- BEGIN / COMMIT / ROLLBACK;
-- autocommit writes;
-- before-image journal;
-- journal-first fsync ordering;
-- hot-journal startup recovery;
-- truncation of transaction-created pages;
-- rollback across tree/catalog/meta root changes.
+BEGIN/COMMIT/ROLLBACK, autocommit writes, before-image journal, fsync ordering, hot-journal recovery, transaction-created-page truncation.
 
 ### v0.3 — Secondary indexes + richer planner ✅
 
-- CREATE INDEX;
-- persistent IndexSchema;
-- byte-key secondary-index B+Tree;
-- typed composite `(value,rowid)` keys;
-- duplicate equality runs;
-- planner PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN;
-- explicit index-to-table rowid lookup;
-- transactional INSERT/DELETE index maintenance;
-- crash recovery across table + indexes.
+CREATE INDEX, persistent index metadata, byte-key B+Tree, `(value,rowid)` keys, duplicate equality runs, secondary-index seek + rowid lookup, atomic table/index maintenance.
 
 ### v0.4 — Relational Execution Engine ✅
 
+UPDATE, richer comparisons, ORDER BY, LIMIT, scalar aggregates, explicit materialized relational stages, transactional indexed-column UPDATE.
+
+### v0.5 — INNER JOIN + Indexed Nested Loop ✅
+
 Central question:
-
-> How should SQL row processing compose as explicit execution mechanisms instead of accumulating statement-specific special cases?
-
-Implemented:
-
-- UPDATE with type validation and fixed INTEGER PRIMARY KEY identity;
-- comparison predicates `= != < <= > >=`;
-- ORDER BY ASC/DESC;
-- LIMIT;
-- COUNT / SUM / MIN / MAX;
-- explicit VM stages `FILTER_COMPARE / COLLECT_ROW / SORT_ROWS / PROJECT_ROWS / AGGREGATE_ROWS / LIMIT_ROWS / EMIT_ROWS`;
-- full-row sort before projection;
-- equality index paths preserved while range predicates correctly fall back to scans;
-- UPDATE maintenance of all secondary indexes;
-- rollback and hot-journal recovery for UPDATE;
-- relational execution documentation and example.
-
-## 3. Current next milestone — v0.5 JOIN 🎯
-
-### Central question
 
 > How can two row sources be composed while keeping name resolution, physical access paths, and join algorithms explicit?
 
-v0.4 now has a visible single-source relational pipeline. JOIN is the next mechanism because it forces the engine to compose multiple sources rather than merely transform one source.
+Implemented:
+
+- `JOIN` / `INNER JOIN`;
+- table aliases and qualified names;
+- ambiguity detection and self-join aliases;
+- equality ON predicate between the two sources;
+- plain nested-loop reference algorithm;
+- primary-key indexed nested loop;
+- secondary-index indexed nested loop;
+- duplicate inner matches;
+- explicit JOIN bytecode rather than an opaque helper;
+- joined rows flowing through v0.4 filter/sort/project/aggregate/limit;
+- no on-disk format change.
+
+## 3. Current next milestone — v0.6 WAL 🎯
+
+### Central question
+
+> How can committed changes be made durable by appending new page images to a log first, while readers still reconstruct the newest database view and checkpoints eventually fold frames back into the main file?
+
+v0.2 established rollback-journal **before images**. v0.6 should deliberately contrast that with WAL **after images**.
 
 ### Target architecture
 
 ```text
-                 logical join
-                 /          \
-          left source     right source
-             │               │
-      scan/PK/index      scan/PK/index
-             \               /
+                 read page N
+                     │
+                     ▼
+              WAL frame lookup?
+                /          \
+              yes          no
+              │             │
+              ▼             ▼
+        newest WAL frame   main db page
               \             /
-               join operator
-                    ↓
-                  filter
-                    ↓
-                projection
-                    ↓
-             sort / limit
-                    ↓
-                  result
+               \           /
+                 Pager view
+
+writer:
+page mutation
+    ↓
+append WAL frame
+    ↓
+append commit marker / commit boundary
+    ↓
+fsync WAL
+
+checkpoint:
+committed WAL frames
+    ↓
+copy newest page versions to database file
+    ↓
+fsync database
+    ↓
+reset/truncate WAL when safe
 ```
 
-### v0.5.1 aliases and qualified names
+### v0.6.1 WAL file format
 
-Support enough name resolution for unambiguous joins:
+Define a small, documented format containing at minimum:
 
-```sql
-SELECT u.name, o.total
-FROM users u
-JOIN orders o ON u.id = o.user_id;
-```
+- magic/version;
+- database page size;
+- frame sequence/order;
+- target page id;
+- page image;
+- transaction/commit boundary metadata;
+- integrity/bounds validation sufficient for educational recovery tests.
 
-Requirements:
+Any durable protocol is part of the format contract even if main database page bytes remain unchanged.
 
-- table aliases;
-- qualified column references;
-- clear ambiguous-column errors;
-- keep name binding in Planner/schema resolution, not storage.
+### v0.6.2 write path
 
-### v0.5.2 INNER JOIN
+A write transaction in WAL mode should not overwrite committed database pages before WAL durability.
 
-Start with one explicit form:
-
-```sql
-FROM left JOIN right ON left.col = right.col
-```
-
-Do not add OUTER/CROSS/NATURAL joins until INNER JOIN mechanics are clear.
-
-### v0.5.3 nested-loop join reference path
-
-Implement the most readable baseline first:
+Conceptual sequence:
 
 ```text
-for left row:
-    for right row:
-        if join predicate:
-            emit combined row
+dirty logical page
+      ↓
+append after-image frame
+      ↓
+commit boundary
+      ↓
+fsync WAL
+      ↓
+transaction visible as committed
 ```
 
-This is the reference algorithm and correctness baseline.
+Do not mix rollback-journal and WAL ordering implicitly. Make mode ownership explicit at Pager/durability boundaries.
 
-### v0.5.4 indexed nested-loop join
+### v0.6.3 read overlay
 
-When the inner join column has a usable primary/secondary equality index:
+Reads must see the newest committed version:
 
 ```text
-outer row
-   ↓
-extract join key
-   ↓
-seek inner PK/index
-   ↓
-matching rows
+page id
+  ↓
+latest committed WAL frame?
+  ├─ yes -> frame bytes
+  └─ no  -> database file bytes
 ```
 
-Planner should expose why the indexed path was chosen. Do not add cost estimates yet; a rule-based choice is enough.
+Keep B+Tree/query layers unaware of whether bytes came from WAL or the database file.
 
-### v0.5.5 join bytecode / operator visibility
+### v0.6.4 crash recovery
 
-The execution model should make the join mechanism visible, for example:
+Tests should cover crashes:
+
+- before commit marker;
+- after committed frames are durable;
+- during/after checkpoint;
+- with multiple committed transactions in WAL;
+- with pages created past the current database EOF.
+
+Uncommitted tail frames must not become visible after reopen.
+
+### v0.6.5 checkpoint
+
+Implement one clear checkpoint mode first. It should copy the newest committed frame for each page to the database file and preserve crash safety.
+
+Expose inspection such as:
 
 ```text
-OPEN_LEFT
-OPEN_RIGHT
-REWIND_LEFT
-REWIND_RIGHT / SEEK_INNER
-JOIN_COMPARE
-...
+.wal
+.checkpoint
 ```
 
-or an equally clear relational operator representation. Do not hide the complete join in one opaque helper.
+or equivalent Python/debug surfaces.
 
-### v0.5.6 optional teaching comparison: hash join
+### v0.6.6 mode boundary
 
-A small in-memory hash join may be added only after nested-loop correctness is complete, to contrast algorithmic trade-offs. It is not required for v0.5 completion.
+A simple explicit open option is preferable to hidden policy, e.g. rollback-journal by default with an educational WAL mode. Do not implement concurrent writer sophistication yet.
 
-### Definition of Done for v0.5
+### Definition of Done for v0.6
 
 Tests should prove:
 
-- aliases and qualified names resolve correctly;
-- ambiguous columns fail clearly;
-- INNER JOIN works with duplicate matches;
-- nested-loop join is correct;
-- indexed nested-loop join is planner-visible and equivalent to nested loop;
-- downstream projection/filter/order/limit compose with joined rows;
-- transactions/storage/index behavior from v0.1-v0.4 remains unchanged;
-- full regression and exact branch-head CI pass.
+- committed WAL transactions survive reopen;
+- uncommitted/crashed WAL tail is ignored;
+- B+Tree/catalog/index/JOIN behavior is unchanged above Pager;
+- checkpoint preserves logical contents;
+- page creation/root splits survive WAL commit/checkpoint;
+- WAL state is inspectable;
+- exact final branch-head CI passes on the full regression suite.
 
-### Explicit non-goals for v0.5
+### Explicit non-goals for v0.6
 
-No LEFT/RIGHT/FULL OUTER JOIN, GROUP BY/HAVING, subqueries, join reordering, cost-based join optimization, spill-to-disk hash tables, WAL, or concurrency.
+No multi-writer concurrency, production SQLite WAL binary compatibility, shared-memory `-shm` implementation, sophisticated checkpoint scheduling, snapshot isolation across many simultaneous connections, cost optimizer, or bounded buffer replacement.
 
 ## 4. Future milestones
-
-### v0.6 — WAL
-
-WAL header/frames, commit marker, read overlay, checkpoint, recovery, snapshot concept, WAL inspection.
 
 ### v0.7 — Buffer manager
 
@@ -222,11 +214,11 @@ Bounded cache, pin/unpin, LRU/Clock replacement, eviction/writeback, hit/miss me
 
 ### v0.8 — Cost-based optimizer
 
-Statistics, cardinality/selectivity estimation, I/O cost model, scan-vs-index costing, join-order costing, `ANALYZE`.
+Statistics, cardinality/selectivity estimation, scan/index costing, join-order costing, `ANALYZE`.
 
 ### v0.9 — Concurrency and locking
 
-Connection abstraction, shared/reserved/pending/exclusive locks, busy timeout, concurrent-process tests.
+Connection abstraction, lock states, busy timeout, concurrent-process tests, transaction interaction with WAL/rollback modes.
 
 ### v1.0 — Educationally complete mini SQLite
 
@@ -262,4 +254,4 @@ advance roadmap
 
 ## 6. Compatibility policy
 
-Before v1.0, Python APIs may evolve between minor versions. Existing page formats should remain readable when practical. Any incompatible byte-layout change requires `FORMAT_VERSION` review, reopen tests, and an explicit compatibility/migration statement.
+Before v1.0, Python APIs may evolve between minor versions. Existing page formats should remain readable when practical. Any incompatible byte-layout or durability-protocol change requires `FORMAT_VERSION` review, reopen tests, and an explicit compatibility/migration statement.

@@ -1,10 +1,10 @@
 # mini-sqlite
 
-A small SQLite-inspired database engine for learning how SQL becomes page-backed execution, indexing, transactions, and relational row processing.
+A small SQLite-inspired database engine for learning how SQL becomes page-backed execution, transactions, indexes, relational operators, and joins.
 
-`mini-sqlite` is **not** a wrapper around Python `sqlite3`. Persisted table/index state lives in B+Trees managed by a Pager.
+`mini-sqlite` is **not** a wrapper around Python `sqlite3`. Table/index state is persisted in B+Trees managed by a Pager.
 
-## Current version: v0.4 — Relational Execution Engine
+## Current version: v0.5 — JOIN
 
 ```text
 SQL
@@ -12,13 +12,18 @@ SQL
 Parser / AST
  ↓
 Planner
- ├─ PRIMARY_KEY
- ├─ SECONDARY_INDEX
- └─ TABLE_SCAN
+ ├─ single-table access: PK / secondary index / scan
+ └─ JOIN inner access:   PK / secondary index / scan
  ↓
 Compiler / VM
  ↓
-source -> filter -> collect -> sort -> aggregate/project -> limit -> emit
+outer source -> inner lookup/scan -> JOIN
+                                 ↓
+                       filter -> sort
+                                 ↓
+                     aggregate/project
+                                 ↓
+                            limit -> emit
  ↓
 Table / Index B+Trees
  ↓
@@ -33,11 +38,12 @@ Version progression:
 v0.1  Page/Pager/B+Tree + SQL/Planner/VM
 v0.2  Rollback Journal + Crash Recovery
 v0.3  Secondary Index + Index Access Path
-v0.4  Relational Execution + UPDATE               ← current
-v0.5  JOIN                                         ← next
+v0.4  Relational Execution + UPDATE
+v0.5  INNER JOIN + Indexed Nested Loop          ← current
+v0.6  WAL                                        ← next
 ```
 
-## v0.4 capabilities
+## v0.5 capabilities
 
 Retained from earlier versions:
 
@@ -46,18 +52,22 @@ Retained from earlier versions:
 - leaf/internal/root splits;
 - persistent schema/index catalog;
 - rollback-journal transactions and hot-journal recovery;
-- primary-key lookup / secondary-index equality lookup / table scan;
-- `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `DELETE`.
+- primary-key / secondary-index equality lookup / table scan;
+- `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `DELETE`, `UPDATE`;
+- comparison predicates, ORDER BY, LIMIT and scalar aggregates.
 
-New in v0.4:
+New in v0.5:
 
-- `UPDATE`;
-- `= != < <= > >=` predicates;
-- `ORDER BY ... ASC/DESC`;
-- `LIMIT`;
-- `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN`, `MAX`;
-- explicit VM relational stages;
-- UPDATE maintenance of every secondary index in one transaction.
+- `JOIN` / `INNER JOIN`;
+- one INNER JOIN per SELECT;
+- `AS` aliases and shorthand aliases;
+- qualified columns such as `u.name`;
+- ambiguous-column detection;
+- plain nested-loop join;
+- indexed nested-loop join through right-side PRIMARY KEY;
+- indexed nested-loop join through right-side secondary index;
+- JOIN output flowing through v0.4 filter/sort/aggregate/project/limit operators;
+- self-join support when aliases disambiguate the two sources.
 
 ## Install and validate
 
@@ -71,113 +81,165 @@ python examples/quickstart.py
 python examples/transactions.py
 python examples/indexes.py
 python examples/relational.py
+python examples/joins.py
 python -m compileall -q mini_sqlite
 ```
 
-## Relational example
+## JOIN example
 
 ```sql
 CREATE TABLE users (
     id INTEGER PRIMARY KEY,
-    name TEXT,
-    age INTEGER
+    name TEXT
 );
 
-CREATE INDEX idx_users_age ON users(age);
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    item TEXT
+);
 
-SELECT name
-FROM users
-WHERE age >= 20
-ORDER BY age DESC
-LIMIT 3;
+SELECT u.name, o.item
+FROM users u
+JOIN orders o ON u.id = o.user_id
+ORDER BY o.id;
 ```
 
-Planner output is intentionally explainable:
+Without an index on `orders.user_id`, Planner shows:
 
 ```text
-SELECT FROM users USING TABLE SCAN
-| FILTER age >= 20
-| SORT age DESC
-| PROJECT name
-| LIMIT 3
+NESTED LOOP | INNER TABLE SCAN
 ```
 
-Why a table scan despite `idx_users_age`? v0.3's index cursor supports equality lookup only. v0.4 refuses to disguise a range scan as an index capability it does not yet have.
+Conceptually:
 
-For equality:
+```text
+for each users row:
+    scan all orders rows
+        compare u.id = o.user_id
+```
+
+After:
 
 ```sql
-SELECT name FROM users WHERE age = 35;
+CREATE INDEX idx_orders_user ON orders(user_id);
 ```
 
-the plan still uses:
+the **same SQL** changes to:
 
 ```text
-SECONDARY INDEX idx_users_age ON age -> ROWID LOOKUP
+INDEXED NESTED LOOP
+| INNER SECONDARY INDEX idx_orders_user ON o.user_id
 ```
 
-## Bytecode exposes the relational pipeline
-
-For a scan/sort/project/limit query, `.bytecode` contains stages like:
+The bytecode changes from:
 
 ```text
-OPEN_READ
-REWIND
-FILTER_COMPARE
-COLLECT_ROW
-NEXT
+REWIND left
+REWIND right
+FILTER_JOIN_EQ
+COLLECT_JOIN_ROW
+NEXT right
+NEXT left
+```
+
+to:
+
+```text
+OPEN_INDEX
+REWIND outer
+SEEK_INDEX_FROM_COLUMN
+INDEX_TO_TABLE
+COLLECT_JOIN_ROW
+INDEX_NEXT
+NEXT outer
+```
+
+This is the central v0.5 lesson: **an index does not change JOIN semantics; it changes how the inner row source is found.**
+
+## Primary-key indexed nested loop
+
+Reversing the written join order:
+
+```sql
+SELECT o.id, u.name
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+```
+
+makes `users.id` the right-side join column. Since it is the INTEGER PRIMARY KEY, Planner selects:
+
+```text
+INDEXED NESTED LOOP | INNER PRIMARY KEY u.id
+```
+
+and bytecode uses:
+
+```text
+SEEK_PK_FROM_COLUMN
+```
+
+No secondary index is required.
+
+## Name resolution
+
+Qualified names are the clearest form:
+
+```sql
+SELECT u.id, o.id
+FROM users u
+JOIN orders o ON u.id = o.user_id;
+```
+
+Unqualified names are accepted only when unique across both sources:
+
+```sql
+SELECT name, item ...   -- valid if unique
+SELECT id ...           -- error if both tables have id
+```
+
+Self-joins require aliases:
+
+```sql
+SELECT e.name, m.name
+FROM people e
+JOIN people m ON e.manager_id = m.id;
+```
+
+## JOIN composes with v0.4 operators
+
+Matched rows are materialized as:
+
+```text
+(left row columns..., right row columns...)
+```
+
+Then existing relational stages apply unchanged:
+
+```text
+JOIN
+ ↓
+FILTER_ROWS
+ ↓
 SORT_ROWS
-PROJECT_ROWS
+ ↓
+AGGREGATE_ROWS or PROJECT_ROWS
+ ↓
 LIMIT_ROWS
+ ↓
 EMIT_ROWS
-HALT
 ```
 
-For aggregates:
+Example:
 
 ```sql
-SELECT COUNT(*), SUM(age), MIN(age), MAX(age) FROM users;
+SELECT o.id, u.name, o.amount
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.amount >= 10
+ORDER BY o.amount DESC
+LIMIT 2;
 ```
-
-`AGGREGATE_ROWS` replaces ordinary projection.
-
-This is the v0.4 core idea: query processing is a composition of explicit mechanisms rather than a growing collection of statement-specific branches.
-
-## UPDATE and indexes
-
-```sql
-UPDATE users SET age = 36 WHERE age = 35;
-```
-
-If `age` has an index, the old index can find matching rowids. Each matching row is changed as one transactional unit:
-
-```text
-remove old index entries
-        ↓
-replace table record
-        ↓
-insert new index entries
-        ↓
-commit through v0.2 rollback journal
-```
-
-A crash cannot durably leave the table updated while its index still points at the old value.
-
-The INTEGER PRIMARY KEY cannot be changed in v0.4; that is an explicit version boundary.
-
-## Aggregate semantics
-
-Supported without GROUP BY:
-
-```text
-COUNT(*)
-COUNT(column)
-SUM(integer_column)
-MIN(column)
-MAX(column)
-```
-
-`COUNT(column)` ignores NULL. `SUM/MIN/MAX` ignore NULL and return NULL when no non-NULL input exists. Full SQL three-valued NULL logic is not implemented yet.
 
 ## Debug commands
 
@@ -186,10 +248,10 @@ MAX(column)
 .indexes
 .pages
 .btree users
-.index idx_users_age
+.index idx_orders_user
 .txn
-.explain SELECT name FROM users WHERE age >= 20 ORDER BY age DESC LIMIT 3;
-.bytecode SELECT name FROM users WHERE age >= 20 ORDER BY age DESC LIMIT 3;
+.explain SELECT u.name, o.item FROM users u JOIN orders o ON u.id=o.user_id;
+.bytecode SELECT u.name, o.item FROM users u JOIN orders o ON u.id=o.user_id;
 ```
 
 ## Source map
@@ -198,8 +260,8 @@ MAX(column)
 mini_sqlite/
 ├── database.py
 ├── sql/                  SQL tokens / AST / parser
-├── planner/              access path + relational plan metadata
-├── vm/                   bytecode compiler + relational execution
+├── planner/              binding + access/join path policy
+├── vm/                   bytecode compiler + relational/join execution
 ├── catalog/              table/index metadata
 ├── btree/                INTEGER-key table/catalog tree
 ├── index/                byte-key secondary-index tree
@@ -217,31 +279,31 @@ For foundations:
 4. `storage/pager.py`
 5. `docs/TRANSACTIONS.md`
 6. `docs/INDEXES.md`
-
-For v0.4:
-
 7. `docs/RELATIONAL_ENGINE.md`
-8. `sql/ast.py`
-9. `sql/parser.py`
-10. `planner/plan.py`
-11. `planner/planner.py`
-12. `vm/compiler.py`
-13. `vm/vm.py`
-14. `tests/test_relational.py`
 
-## Explicit v0.4 non-goals
+For v0.5:
 
-- JOIN;
+8. `docs/JOINS.md`
+9. `sql/ast.py`
+10. `sql/parser.py`
+11. `planner/plan.py`
+12. `planner/planner.py`
+13. `vm/compiler.py`
+14. `vm/vm.py`
+15. `tests/test_joins.py`
+
+## Explicit v0.5 non-goals
+
+- LEFT / RIGHT / FULL OUTER JOIN;
+- multiple JOIN chains;
+- arbitrary ON expression trees;
+- hash join / merge join;
+- join reordering and cost-based join selection;
 - GROUP BY / HAVING;
-- aliases / qualified columns;
-- AND / OR expression trees;
-- complete SQL NULL semantics;
-- arithmetic expressions in UPDATE;
-- INTEGER PRIMARY KEY UPDATE;
-- streaming LIMIT / external sort;
+- subqueries / CTEs;
+- full SQL NULL semantics;
 - range index scans;
-- statistics / cost-based optimization;
-- WAL / concurrent connections;
+- WAL / concurrent readers-writer protocol;
 - SQLite binary compatibility.
 
-See `Plan.md`. The next milestone is **v0.5: JOIN**.
+See `Plan.md`. The next milestone is **v0.6: WAL**.

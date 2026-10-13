@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any
 
 from mini_sqlite.catalog.schema import Column, IndexSchema, TableSchema
-from mini_sqlite.sql.ast import AggregateFunction, ComparisonPredicate
+from mini_sqlite.sql.ast import AggregateFunction, CompareOp, ComparisonPredicate
 
 
 class AccessPath(str, Enum):
@@ -33,6 +33,22 @@ class AssignmentSpec:
     column_index: int
     column_name: str
     value: Any
+
+
+@dataclass(frozen=True)
+class JoinedPredicateSpec:
+    column_index: int
+    column_name: str
+    op: CompareOp
+    value: Any
+
+
+@dataclass(frozen=True)
+class JoinSpec:
+    left_column_index: int
+    right_column_index: int
+    left_column_name: str
+    right_column_name: str
 
 
 @dataclass(frozen=True)
@@ -72,6 +88,31 @@ class SelectPlan:
 
 
 @dataclass(frozen=True)
+class JoinSelectPlan:
+    left_schema: TableSchema
+    right_schema: TableSchema
+    left_name: str
+    right_name: str
+    join: JoinSpec
+    inner_access_path: AccessPath
+    projection: list[int]
+    projection_names: list[str]
+    where: JoinedPredicateSpec | None = None
+    inner_index: IndexSchema | None = None
+    order_by: OrderSpec | None = None
+    limit: int | None = None
+    aggregates: tuple[AggregateSpec, ...] = ()
+
+    @property
+    def is_aggregate(self) -> bool:
+        return bool(self.aggregates)
+
+    @property
+    def combined_width(self) -> int:
+        return len(self.left_schema.columns) + len(self.right_schema.columns)
+
+
+@dataclass(frozen=True)
 class DeletePlan:
     schema: TableSchema
     where: ComparisonPredicate | None
@@ -88,4 +129,12 @@ class UpdatePlan:
     index: IndexSchema | None = None
 
 
-Plan = CreateTablePlan | CreateIndexPlan | InsertPlan | SelectPlan | DeletePlan | UpdatePlan
+Plan = (
+    CreateTablePlan
+    | CreateIndexPlan
+    | InsertPlan
+    | SelectPlan
+    | JoinSelectPlan
+    | DeletePlan
+    | UpdatePlan
+)

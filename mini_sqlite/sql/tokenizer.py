@@ -47,6 +47,7 @@ class Tokenizer:
                 "=": TokenType.EQ,
                 "<": TokenType.LT,
                 ">": TokenType.GT,
+                ".": TokenType.DOT,
                 ",": TokenType.COMMA,
                 "(": TokenType.LPAREN,
                 ")": TokenType.RPAREN,

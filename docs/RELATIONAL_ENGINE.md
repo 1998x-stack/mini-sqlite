@@ -191,3 +191,19 @@ v0.4 does not add:
 - external sort;
 - range index scans;
 - cost-based optimization.
+
+## 10. v0.5 extension: JOIN as a richer source
+
+v0.5 does not replace this pipeline. It produces the working row set from two sources instead of one:
+
+```text
+left source + right source
+        ↓
+      JOIN
+        ↓
+   working_rows
+        ↓
+filter / sort / aggregate-project / limit / emit
+```
+
+See `JOINS.md`. This keeps the v0.4 operators reusable and makes JOIN an execution-source composition problem rather than a second copy of relational processing logic.

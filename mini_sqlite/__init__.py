@@ -3,4 +3,4 @@ from .database import Database
 from .errors import MiniSQLiteError
 
 __all__ = ["Database", "MiniSQLiteError"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

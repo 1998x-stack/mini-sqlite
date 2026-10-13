@@ -12,6 +12,13 @@ class OpCode(Enum):
     SEEK_INDEX_EQ = auto()
     INDEX_TO_TABLE = auto()
 
+    # v0.5 join-source instructions.
+    SEEK_PK_FROM_COLUMN = auto()
+    SEEK_INDEX_FROM_COLUMN = auto()
+    FILTER_JOIN_EQ = auto()
+    COLLECT_JOIN_ROW = auto()
+    FILTER_ROWS = auto()
+
     # v0.1-v0.3 row-at-a-time instructions remain readable for historical code.
     FILTER_EQ = auto()
     PROJECT = auto()

@@ -25,6 +25,7 @@ class AggregateFunction(str, Enum):
 
 @dataclass(frozen=True)
 class ComparisonPredicate:
+    # v0.5 allows either unqualified names (age) or qualified names (u.age).
     column: str
     op: CompareOp
     value: Any
@@ -58,6 +59,23 @@ class Assignment:
 
 
 @dataclass(frozen=True)
+class TableRef:
+    name: str
+    alias: str | None = None
+
+    @property
+    def visible_name(self) -> str:
+        return self.alias or self.name
+
+
+@dataclass(frozen=True)
+class JoinClause:
+    right: TableRef
+    left_column: str
+    right_column: str
+
+
+@dataclass(frozen=True)
 class CreateTableStmt:
     name: str
     columns: list[Column]
@@ -83,11 +101,17 @@ class SelectStmt:
     where: ComparisonPredicate | None = None
     order_by: OrderBy | None = None
     limit: int | None = None
+    table_alias: str | None = None
+    join: JoinClause | None = None
 
     @property
     def columns(self) -> list[str]:
         """Compatibility view used by older teaching/tests for column-only SELECTs."""
         return [item for item in self.items if isinstance(item, str)]
+
+    @property
+    def left(self) -> TableRef:
+        return TableRef(self.table, self.table_alias)
 
 
 @dataclass(frozen=True)

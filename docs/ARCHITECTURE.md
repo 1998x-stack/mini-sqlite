@@ -12,7 +12,7 @@ Database.execute(sql)
        AST
         │
         ▼
-     Planner ───────────── access path + relational stages
+     Planner ───────────── binding + access path + join algorithm + relational stages
         │
         ▼
        Plan
@@ -25,100 +25,134 @@ Database.execute(sql)
         │
         ▼
  VirtualMachine
-    │          │
-    │          └──────────────┐
-    ▼                         ▼
-Table Cursor             Index Cursor
-    │                         │
-    ▼                         ▼
-integer-key B+Tree       byte-key B+Tree
-    │                         │
-    └───────────┬─────────────┘
-                ▼
-              Pager
-         ┌──────┴──────┐
-         ▼             ▼
- rollback journal   database file
+   │          │
+   │          ├────────────── joined row working set
+   │          │
+   ▼          ▼
+Table       Index Cursor
+Cursor         │
+   │           ▼
+   ▼        byte-key B+Tree
+integer-key    │
+B+Tree         │
+   └──────┬────┘
+          ▼
+        Pager
+   ┌──────┴──────┐
+   ▼             ▼
+rollback      database
+journal         file
 ```
 
-Parser and Planner never read page bytes. Both B+Tree families use Pager; Pager remains the sole durability boundary.
+Parser and Planner never read page bytes. JOIN is implemented by composing existing table/index cursors, not by adding a new storage primitive.
 
-## 2. Storage remains unchanged in v0.4
+## 2. Storage remains unchanged in v0.5
 
-v0.4 does not introduce a new on-disk format. It retains:
+v0.5 introduces no new page type or database-file layout. It retains:
 
-- page 0 database metadata;
+- page 0 metadata;
 - INTEGER-key table/catalog B+Tree pages;
 - byte-key secondary-index B+Tree pages;
-- JSON catalog records containing table/index metadata;
+- JSON catalog table/index metadata;
 - rollback-journal before-images.
 
-The architectural change is above storage: richer planning and relational row processing.
+Joined rows are transient VM tuples only.
 
-## 3. Catalog and root ownership
+## 3. Planner responsibilities
 
-A `TableSchema` persists table root, columns, and secondary indexes. Root movement can occur in catalog, table, or index trees. Tree callbacks persist the new root in the owning metadata.
-
-UPDATE may increase row size enough to cause a table split and may also mutate/split secondary indexes. Those root changes are ordinary Pager writes and remain rollback-safe.
-
-## 4. Planner
-
-v0.4 keeps three physical access paths:
+The Planner now performs four visibly separate jobs:
 
 ```text
-PRIMARY_KEY
-SECONDARY_INDEX
-TABLE_SCAN
+name binding
+    ↓
+physical source/access selection
+    ↓
+JOIN inner-path selection
+    ↓
+post-source relational metadata
 ```
 
-Only equality predicates can use PK/secondary-index seeks. Other comparisons scan.
-
-The SELECT plan also carries relational processing metadata:
+For a single table, access remains:
 
 ```text
-where predicate
-order specification
-projection
-aggregate specifications
-limit
+PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN
 ```
 
-This separates **where rows come from** from **how rows are transformed**.
-
-## 5. VM relational working set
-
-v0.4 adds:
+For v0.5 JOIN, the written left source remains outer. The right ON column selects:
 
 ```text
-FILTER_COMPARE
-COLLECT_ROW
+right primary key       -> indexed nested loop via PK seek
+right secondary index   -> indexed nested loop via index seek + rowid lookup
+otherwise               -> nested loop via right table scan
+```
+
+There is deliberately no cost model or join reordering yet.
+
+## 4. Joined row representation
+
+Two physical table records are decoded independently and combined only in VM memory:
+
+```text
+(left columns..., right columns...)
+```
+
+Planner name binding maps SQL references onto flat indexes in this transient row. Therefore v0.4 operators can be reused unchanged:
+
+```text
+FILTER_ROWS
 SORT_ROWS
 PROJECT_ROWS
 AGGREGATE_ROWS
 LIMIT_ROWS
 EMIT_ROWS
-UPDATE_CURRENT
 ```
 
-Source cursors still navigate B+Trees. `COLLECT_ROW` materializes decoded rows into a working set; later opcodes transform it.
+## 5. JOIN bytecode
 
-The working-set design is intentionally simple and inspectable. It is not presented as a production execution strategy.
-
-## 6. UPDATE composition
-
-`UPDATE_CURRENT` owns logical row replacement, but not durability policy:
+Plain nested loop exposes both cursor loops:
 
 ```text
-remove old index entries
-        ↓
-replace table record
-        ↓
-insert new index entries
-        ↓
-Pager transaction commits all participating pages
+REWIND left
+REWIND right
+FILTER_JOIN_EQ
+COLLECT_JOIN_ROW
+NEXT right
+NEXT left
 ```
 
-If any step fails, the v0.2 transaction manager rolls back the active transaction. B+Trees still know nothing about COMMIT/ROLLBACK.
+Primary-key indexed nested loop replaces the full inner loop with:
+
+```text
+SEEK_PK_FROM_COLUMN
+COLLECT_JOIN_ROW
+```
+
+Secondary-index nested loop uses:
+
+```text
+SEEK_INDEX_FROM_COLUMN
+INDEX_TO_TABLE
+COLLECT_JOIN_ROW
+INDEX_NEXT
+```
+
+The VM, rather than B+Tree, owns this composition.
+
+## 6. Durability layering remains intact
+
+JOIN is read-only. Existing write paths still use v0.2 rollback-journal transactions, and table/index maintenance from v0.3/v0.4 is unchanged.
+
+That layering is intentional:
+
+```text
+query semantics / JOIN
+        ↓
+cursors / B+Trees
+        ↓
+Pager durability
+```
+
+v0.6 WAL should replace/extend the bottom durability mechanism without rewriting JOIN or planner semantics.
 
 ## 7. Cross-version layering invariant
 
@@ -127,6 +161,7 @@ v0.1  pages + primary B+Tree + SQL/VM
 v0.2  Pager rollback journal
 v0.3  secondary index access path
 v0.4  relational row-processing stages
+v0.5  two-source JOIN composition
 ```
 
 Each version adds a mechanism at the narrowest useful boundary instead of replacing earlier layers.

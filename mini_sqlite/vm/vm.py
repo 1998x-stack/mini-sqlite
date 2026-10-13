@@ -7,7 +7,13 @@ from mini_sqlite.btree import BTree, BTreeCursor
 from mini_sqlite.catalog import Catalog, IndexSchema, TableSchema
 from mini_sqlite.errors import CorruptionError, SchemaError
 from mini_sqlite.index import SecondaryIndex, SecondaryIndexCursor
-from mini_sqlite.planner.plan import AggregateSpec, AssignmentSpec, OrderSpec
+from mini_sqlite.planner.plan import (
+    AggregateSpec,
+    AssignmentSpec,
+    JoinedPredicateSpec,
+    JoinSpec,
+    OrderSpec,
+)
 from mini_sqlite.sql.ast import AggregateFunction, CompareOp, ComparisonPredicate
 from mini_sqlite.storage import Pager, RecordCodec
 from mini_sqlite.vm.instruction import Instruction
@@ -39,11 +45,12 @@ class VMResult:
 class VirtualMachine:
     """Tiny VDBE-inspired interpreter.
 
-    v0.4 adds a materialized relational working set. Cursor instructions still
+    v0.5 keeps the materialized relational working set and adds explicit
+    two-source join instructions. Cursor instructions still
     expose physical access paths, while explicit relational opcodes transform
     rows in the SQL order visible in bytecode:
 
-        source -> filter -> collect -> sort -> aggregate/project -> limit -> emit
+        source(s) -> join -> filter -> sort -> aggregate/project -> limit -> emit
 
     This is deliberately simpler than SQLite's production VDBE and future
     iterator/vectorized engines, but it makes relational stages inspectable.
@@ -132,6 +139,49 @@ class VirtualMachine:
                     raise CorruptionError(
                         f"index {index_cur.schema.name} references missing rowid {rowid}"
                     )
+
+            elif op == OpCode.SEEK_PK_FROM_COLUMN:
+                target = cursors[ins.p1]
+                source = cursors[ins.p2]
+                source_values = self._cursor_values(source, "SEEK_PK_FROM_COLUMN")
+                key = source_values[ins.p3]
+                if key is None or not isinstance(key, int) or not target.cursor.seek(key):
+                    pc = int(ins.p4)
+                    continue
+
+            elif op == OpCode.SEEK_INDEX_FROM_COLUMN:
+                index_cur = index_cursors[ins.p1]
+                source = cursors[ins.p2]
+                source_values = self._cursor_values(source, "SEEK_INDEX_FROM_COLUMN")
+                value = source_values[ins.p3]
+                if not index_cur.cursor.seek_equal(value):
+                    pc = int(ins.p4)
+                    continue
+
+            elif op == OpCode.FILTER_JOIN_EQ:
+                left = cursors[ins.p1]
+                right = cursors[ins.p2]
+                spec: JoinSpec = ins.p4
+                left_values = self._cursor_values(left, "FILTER_JOIN_EQ")
+                right_values = self._cursor_values(right, "FILTER_JOIN_EQ")
+                if left_values[spec.left_column_index] != right_values[spec.right_column_index]:
+                    pc = ins.p3
+                    continue
+
+            elif op == OpCode.COLLECT_JOIN_ROW:
+                left = cursors[ins.p1]
+                right = cursors[ins.p2]
+                left_values = self._cursor_values(left, "COLLECT_JOIN_ROW")
+                right_values = self._cursor_values(right, "COLLECT_JOIN_ROW")
+                working_rows.append(tuple(left_values) + tuple(right_values))
+
+            elif op == OpCode.FILTER_ROWS:
+                spec: JoinedPredicateSpec = ins.p4
+                working_rows = [
+                    row
+                    for row in working_rows
+                    if self._compare(row[spec.column_index], spec.op, spec.value)
+                ]
 
             elif op == OpCode.FILTER_EQ:  # historical bytecode support
                 cur = cursors[ins.p1]
@@ -282,6 +332,13 @@ class VirtualMachine:
             pc += 1
 
         return VMResult(rows=rows, rowcount=rowcount)
+
+    @staticmethod
+    def _cursor_values(cursor: OpenCursor, operation: str) -> tuple[Any, ...]:
+        current = cursor.cursor.current
+        if current is None:
+            raise RuntimeError(f"{operation} without current row")
+        return tuple(RecordCodec.decode(current.value))
 
     @staticmethod
     def _compare(left: object, op: CompareOp, right: object) -> bool:

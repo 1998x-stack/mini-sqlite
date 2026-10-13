@@ -27,6 +27,9 @@ class TokenType(Enum):
     SUM = auto()
     MIN = auto()
     MAX = auto()
+    JOIN = auto()
+    INNER = auto()
+    AS = auto()
     PRIMARY = auto()
     KEY = auto()
     INTEGER = auto()
@@ -47,6 +50,7 @@ class TokenType(Enum):
     LE = auto()
     GT = auto()
     GE = auto()
+    DOT = auto()
     COMMA = auto()
     LPAREN = auto()
     RPAREN = auto()
@@ -77,6 +81,9 @@ KEYWORDS = {
     "SUM": TokenType.SUM,
     "MIN": TokenType.MIN,
     "MAX": TokenType.MAX,
+    "JOIN": TokenType.JOIN,
+    "INNER": TokenType.INNER,
+    "AS": TokenType.AS,
     "PRIMARY": TokenType.PRIMARY,
     "KEY": TokenType.KEY,
     "INTEGER": TokenType.INTEGER,

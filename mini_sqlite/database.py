@@ -10,7 +10,7 @@ from mini_sqlite.catalog import Catalog
 from mini_sqlite.constants import META_PAGE_ID
 from mini_sqlite.index import ByteKeyBTree
 from mini_sqlite.planner import Planner
-from mini_sqlite.planner.plan import SelectPlan
+from mini_sqlite.planner.plan import JoinSelectPlan, SelectPlan
 from mini_sqlite.sql import Parser
 from mini_sqlite.sql.ast import BeginStmt, CommitStmt, RollbackStmt
 from mini_sqlite.storage.meta import DatabaseMeta
@@ -117,7 +117,7 @@ class Database:
 
         # Read-only statements need no rollback journal in autocommit mode.
         # Any write statement outside BEGIN gets its own durable transaction.
-        autocommit_write = not self.in_transaction and not isinstance(plan, SelectPlan)
+        autocommit_write = not self.in_transaction and not isinstance(plan, (SelectPlan, JoinSelectPlan))
         if autocommit_write:
             self.begin()
 

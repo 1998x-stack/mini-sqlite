@@ -14,10 +14,12 @@ from mini_sqlite.sql.ast import (
     CreateTableStmt,
     DeleteStmt,
     InsertStmt,
+    JoinClause,
     OrderBy,
     RollbackStmt,
     SelectStmt,
     Statement,
+    TableRef,
     UpdateStmt,
 )
 from mini_sqlite.sql.tokenizer import Tokenizer
@@ -82,6 +84,12 @@ class Parser:
 
     def _ident(self) -> str:
         return str(self._expect(TokenType.IDENT).value)
+
+    def _column_ref(self) -> str:
+        first = self._ident()
+        if self._match(TokenType.DOT):
+            return f"{first}.{self._ident()}"
+        return first
 
     def _literal(self):
         if self.current.type in (TokenType.NUMBER, TokenType.STRING):
@@ -165,10 +173,20 @@ class Parser:
                     raise self._error(f"{function.value}(*) is not supported")
                 column = None
             else:
-                column = self._ident()
+                column = self._column_ref()
             self._expect(TokenType.RPAREN)
             return AggregateExpr(function, column)
-        return self._ident()
+        return self._column_ref()
+
+    def _table_ref(self) -> TableRef:
+        name = self._ident()
+        alias = None
+        if self._match(TokenType.AS):
+            alias = self._ident()
+        elif self.current.type == TokenType.IDENT:
+            # SQL permits FROM users u as shorthand for FROM users AS u.
+            alias = self._ident()
+        return TableRef(name, alias)
 
     def _select(self) -> SelectStmt:
         self._expect(TokenType.SELECT)
@@ -179,11 +197,38 @@ class Parser:
             while self._match(TokenType.COMMA):
                 items.append(self._select_item())
         self._expect(TokenType.FROM)
-        table = self._ident()
+        left = self._table_ref()
+
+        join = None
+        if self._match(TokenType.INNER):
+            self._expect(TokenType.JOIN)
+            join = self._join_clause()
+        elif self._match(TokenType.JOIN):
+            join = self._join_clause(after_join_keyword=True)
+
         where = self._optional_where()
         order_by = self._optional_order_by()
         limit = self._optional_limit()
-        return SelectStmt(table, items, where, order_by, limit)
+        return SelectStmt(
+            left.name,
+            items,
+            where,
+            order_by,
+            limit,
+            table_alias=left.alias,
+            join=join,
+        )
+
+    def _join_clause(self, after_join_keyword: bool = False) -> JoinClause:
+        # `after_join_keyword` exists only to make the two parse branches above
+        # self-documenting; both arrive here with JOIN already consumed.
+        _ = after_join_keyword
+        right = self._table_ref()
+        self._expect(TokenType.ON)
+        left_column = self._column_ref()
+        self._expect(TokenType.EQ)
+        right_column = self._column_ref()
+        return JoinClause(right, left_column, right_column)
 
     def _delete(self) -> DeleteStmt:
         self._expect(TokenType.DELETE)
@@ -210,7 +255,7 @@ class Parser:
     def _optional_where(self) -> ComparisonPredicate | None:
         if not self._match(TokenType.WHERE):
             return None
-        column = self._ident()
+        column = self._column_ref()
         operators = {
             TokenType.EQ: CompareOp.EQ,
             TokenType.NE: CompareOp.NE,
@@ -229,7 +274,7 @@ class Parser:
         if not self._match(TokenType.ORDER):
             return None
         self._expect(TokenType.BY)
-        column = self._ident()
+        column = self._column_ref()
         descending = False
         if self._match(TokenType.ASC):
             descending = False
