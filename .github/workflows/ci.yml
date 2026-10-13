@@ -33,5 +33,7 @@ jobs:
         run: python examples/wal.py
       - name: Smoke buffer pool
         run: python examples/buffer_pool.py
+      - name: Smoke optimizer
+        run: python examples/optimizer.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite

@@ -1,62 +1,71 @@
-# mini-sqlite v0.7
+# mini-sqlite v0.8.0 — Cost-Based Optimizer
 
-## Theme
+This frozen branch adds an inspectable cost-based planner on top of the v0.1-v0.7 storage, durability, relational, JOIN, WAL, and bounded-buffer foundations.
 
-**Bounded page residency with pin/unpin, LRU/CLOCK replacement, and durability-aware dirty eviction.**
-
-Earlier versions quietly kept every touched page in an unbounded Python dictionary. v0.7 makes memory pressure explicit:
+## Primary mental model
 
 ```text
-database pages >> buffer frames
-         ↓
-cache hit / miss
-         ↓
-replacement candidate
-         ↓
-pin + durability checks
-         ↓
-evict / write back
+ANALYZE
+   ↓
+Persistent statistics
+   ↓
+Cardinality / selectivity estimates
+   ↓
+Candidate physical plans
+   ↓
+Cost model
+   ↓
+Minimum-cost choice
+   ↓
+Bytecode / VM
 ```
 
-## Delta from v0.6
+## New capabilities
 
-Added:
+- `ANALYZE;` and `ANALYZE table;`;
+- persistent `TableStats` / `ColumnStats` inside catalog rows;
+- row count, NULL count, distinct count, min/max;
+- top-16 most-common-value frequencies for skew;
+- explicit statistics staleness model;
+- table-scan vs secondary-index cost comparison;
+- equality and simple range cardinality estimation;
+- two-table JOIN orientation comparison;
+- physical JOIN order may differ from SQL order;
+- join inner path may use PK, secondary index, or scan;
+- EXPLAIN shows estimated rows, chosen cost, and rejected candidates;
+- `Catalog.get_table(...).stats` inspection;
+- rollback/WAL persistence tests for statistics.
 
-- `Database(..., buffer_pages=N)`;
-- `replacement_policy="clock" | "lru"`;
-- explicit `BufferFrame` and `BufferManager`;
-- bounded resident-page invariant;
-- pin/unpin page lifetime through `Pager.pin_page()`;
-- LRU replacement;
-- CLOCK second-chance replacement;
-- durability-aware dirty victim checks;
-- rollback-mode dirty writeback + eviction inside active transactions;
-- WAL protection for uncommitted dirty frames;
-- cache hit/miss/eviction/dirty-eviction metrics;
-- `.buffer` and `.frames` shell commands;
-- `docs/BUFFER_MANAGER.md`;
-- `examples/buffer_pool.py`;
-- `tests/test_buffer_manager.py`.
+## Important files
 
-## Important source files
+```text
+mini_sqlite/catalog/statistics.py
+mini_sqlite/catalog/catalog.py
+mini_sqlite/planner/optimizer.py
+mini_sqlite/planner/cost_planner.py
+mini_sqlite/planner/plan.py
+mini_sqlite/vm/cost_compiler.py
+examples/optimizer.py
+tests/test_optimizer.py
+docs/OPTIMIZER.md
+```
 
-- `mini_sqlite/storage/buffer.py`
-- `mini_sqlite/storage/pager.py`
-- `mini_sqlite/btree/btree.py`
-- `mini_sqlite/index/btree.py`
-- `mini_sqlite/database.py`
-- `tests/test_buffer_manager.py`
-- `docs/BUFFER_MANAGER.md`
+## Reading order
 
-## Recommended reading order
+1. `docs/OPTIMIZER.md`
+2. `catalog/statistics.py`
+3. `Catalog.analyze()`
+4. `planner/optimizer.py`
+5. `planner/cost_planner.py`
+6. `vm/cost_compiler.py`
+7. `tests/test_optimizer.py`
+8. `examples/optimizer.py`
 
-1. `docs/BUFFER_MANAGER.md`
-2. `storage/buffer.py`
-3. `storage/pager.py`
-4. `tests/test_buffer_manager.py`
-5. `docs/TRANSACTIONS.md`
-6. `docs/WAL.md`
-7. `examples/buffer_pool.py`
+## Compatibility
+
+The main database page format and B+Tree/index layouts are unchanged.
+
+Catalog table JSON gains an optional `stats` field. Older v0.7-style decoders ignore unknown JSON fields, while v0.8 accepts catalog rows with no stats. Statistics therefore remain metadata rather than a new page type.
 
 ## Validation
 
@@ -69,21 +78,14 @@ python examples/relational.py
 python examples/joins.py
 python examples/wal.py
 python examples/buffer_pool.py
+python examples/optimizer.py
 python -m compileall -q mini_sqlite
 ```
 
-## Storage compatibility
+## Explicit limits
 
-The main DB page layout, rollback-journal format, and WAL format are unchanged from v0.6. v0.7 changes only in-memory residency and public configuration.
-
-## Important limitation
-
-In WAL mode, uncommitted dirty frames are deliberately non-evictable. A transaction whose dirty working set exceeds `buffer_pages` raises `BufferPoolFullError`. This keeps WAL atomicity obvious without adding a second hidden unbounded transaction cache or spill file.
-
-## Explicit non-goals
-
-No async I/O, prefetching, mmap/direct-I/O tuning, ARC/2Q, shared cache, transaction spill file, concurrent buffer access, cost-based planning, or multi-connection lock manager.
+No many-way join enumeration, production histograms, multi-column correlation statistics, hash/merge join, adaptive optimization, or index range scan.
 
 ## Next
 
-v0.8 should add a **cost-based optimizer**: persisted/analyzed statistics, cardinality/selectivity estimates, comparable access-path costs, and JOIN-order decisions that can be inspected rather than hard-coded.
+v0.9: **Concurrency / Locking** — multiple connections, lock state, busy handling, and interaction between readers/writers under rollback and WAL durability modes.

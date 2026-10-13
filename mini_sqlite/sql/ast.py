@@ -128,6 +128,11 @@ class UpdateStmt:
 
 
 @dataclass(frozen=True)
+class AnalyzeStmt:
+    table: str | None = None
+
+
+@dataclass(frozen=True)
 class BeginStmt:
     pass
 
@@ -149,6 +154,7 @@ Statement = (
     | SelectStmt
     | DeleteStmt
     | UpdateStmt
+    | AnalyzeStmt
     | BeginStmt
     | CommitStmt
     | RollbackStmt

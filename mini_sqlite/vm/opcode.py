@@ -4,6 +4,7 @@ from enum import Enum, auto
 class OpCode(Enum):
     CREATE_TABLE = auto()
     CREATE_INDEX = auto()
+    ANALYZE = auto()
     OPEN_READ = auto()
     OPEN_WRITE = auto()
     OPEN_INDEX = auto()

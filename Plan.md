@@ -79,128 +79,86 @@ Implemented:
 - `.buffer` / `.frames` inspection;
 - no page-format or durability-format change.
 
-## 3. Current next milestone — v0.8 Cost-Based Optimizer 🎯
+## 3. Completed milestone — v0.8 Cost-Based Optimizer ✅
+
+Central question:
+
+> When several correct plans exist, how can the database estimate their work and choose from data rather than fixed rules?
+
+Implemented:
+
+- `ANALYZE` / `ANALYZE table` statistics collection;
+- persistent row/null/distinct/min/max statistics;
+- top-16 most-common-value frequencies for skew;
+- explicit stale-statistics semantics;
+- equality/range cardinality estimates;
+- table scan vs PK/index candidate costs;
+- two legal JOIN orientations compared by cost;
+- physical JOIN order independent from SQL order;
+- PK/index/scan inner probes under either orientation;
+- EXPLAIN estimated rows, estimated cost and rejected candidates;
+- `Catalog.get_table(...).stats` inspection;
+- rollback/WAL durability tests for optimizer metadata.
+
+## 4. Current next milestone — v0.9 Concurrency / Locking 🎯
 
 ### Central question
 
-> When several correct plans exist, how can the database estimate their work and choose a plan from data rather than from fixed rules?
-
-v0.3-v0.5 introduced physical alternatives but Planner selection is still mostly heuristic: PK equality beats secondary equality, otherwise scan; JOIN outer/inner order is syntax-driven.
+> What changes when two independent connections can read or write the same database at the same time?
 
 ### Target architecture
 
 ```text
-Catalog statistics
-   ├─ row count
-   ├─ distinct count
-   ├─ min / max
-   └─ optional histograms
-          ↓
-Cardinality estimator
-          ↓
-Cost model
-   ├─ table scan
-   ├─ PK seek
-   ├─ index seek + row lookup
-   └─ nested-loop alternatives
-          ↓
-Candidate plans
-          ↓
-choose min estimated cost
-          ↓
-EXPLAIN estimated rows / cost
+Connection A                 Connection B
+     │                            │
+ transaction                  transaction
+     │                            │
+     └──────── Lock Manager ──────┘
+                  │
+        shared / reserved / exclusive
+                  │
+                Pager
+          ┌───────┴───────┐
+       rollback          WAL
 ```
 
-### v0.8.1 ANALYZE / statistics
+### v0.9.1 connection-visible lock states
 
-Add a small statistics subsystem rather than reading the entire table during every planning decision. Suggested first metadata:
+Teach a small state machine first. Rollback mode should make reader/writer exclusion visible rather than relying on accidental process behavior.
 
-```text
-table row_count
-column distinct_count
-column null_count
-column min/max for INTEGER
-index metadata
-```
+### v0.9.2 busy handling
 
-Statistics should be persistent or explicitly recomputable, with a clear staleness model.
+Add deterministic busy errors and a bounded busy timeout/retry policy. Never spin forever.
 
-### v0.8.2 selectivity estimation
+### v0.9.3 WAL reader/writer distinction
 
-Teach simple estimates first:
+WAL should demonstrate why readers can continue to observe committed snapshots while one writer appends newer frames, while still keeping a single-writer simplification.
 
-```text
-PK equality            ≈ 1 row
-indexed equality       ≈ N / distinct
-range on INTEGER       ≈ fraction from min/max
-unknown predicate      conservative fallback
-```
+### v0.9.4 multi-connection tests
 
-Correctness must never depend on estimate quality; estimates only choose among equivalent plans.
+Use separate `Database` instances against one file and cover reader-reader, reader-writer, writer-writer, rollback, crash/reopen, and checkpoint interactions.
 
-### v0.8.3 access-path costs
+### Definition of Done for v0.9
 
-Expose comparable conceptual costs, for example:
-
-```text
-table scan              pages(table)
-PK seek                 tree_height + 1
-secondary equality      index_height + matches * table_lookup
-```
-
-Use buffer-aware page concepts, but do not pretend to model real hardware precisely.
-
-### v0.8.4 JOIN order
-
-For two-table INNER JOIN, compare at least both legal nested-loop orientations:
-
-```text
-A outer -> B inner
-B outer -> A inner
-```
-
-Include whether the chosen inner side has PK/index lookup. This is the first version where SQL FROM order should not necessarily equal physical join order.
-
-### v0.8.5 EXPLAIN observability
-
-Show:
-
-```text
-estimated rows
-estimated cost
-chosen access path
-rejected alternatives
-join orientation
-```
-
-The teaching goal is to make optimizer reasoning auditable.
-
-### Definition of Done for v0.8
-
-- statistics can be collected deterministically;
-- equality/range estimates have tests;
-- scan vs index choice can flip with data distribution;
-- JOIN orientation can flip based on cardinality/indexes;
-- EXPLAIN exposes estimates/costs;
-- stale/missing stats have safe fallbacks;
-- all v0.1-v0.7 storage/durability/buffer tests stay green;
+- lock state is explicit and inspectable;
+- conflicting writers fail or wait deterministically;
+- rollback mode reader/writer rules are tested;
+- WAL reader/writer behavior is tested;
+- transaction cleanup releases locks after commit/rollback/error;
+- old optimizer/storage/durability tests stay green;
 - exact final branch-head CI passes.
 
-### Explicit non-goals for v0.8
+### Explicit non-goals for v0.9
 
-No Selinger-style exhaustive many-way JOIN optimizer, sophisticated histograms, adaptive runtime reoptimization, vectorized execution, ML cardinality estimation, or concurrent DDL/statistics maintenance.
+No MVCC engine, distributed locking, deadlock graph detector, row-level locks, predicate locks, Serializable Snapshot Isolation, or multi-writer WAL.
 
-## 4. Future milestones
-
-### v0.9 — Concurrency and locking
-
-Connection abstraction, lock states, busy timeout, concurrent-process tests, transaction interaction with WAL/rollback modes.
+## 5. Future milestones
 
 ### v1.0 — Educationally complete mini SQLite
 
 Durable rollback/WAL modes, primary/secondary indexes, relational operators and joins, bounded page cache, explainable cost planning, crash tests, documented formats, benchmark/inspection tooling.
 
-## 5. Version-development protocol
+## 6. Version-development protocol
 
 ```text
 read main/Agents.md + Plan.md + version.md
@@ -228,6 +186,6 @@ restore canonical main Agents.md/version.md
 advance roadmap
 ```
 
-## 6. Compatibility policy
+## 7. Compatibility policy
 
 Before v1.0, Python APIs may evolve between minor versions. Existing main database page formats should remain readable when practical. Any incompatible byte-layout or durability-protocol change requires format review, reopen tests, and an explicit compatibility/migration statement.

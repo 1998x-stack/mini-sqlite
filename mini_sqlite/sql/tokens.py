@@ -40,6 +40,7 @@ class TokenType(Enum):
     COMMIT = auto()
     END = auto()
     ROLLBACK = auto()
+    ANALYZE = auto()
     IDENT = auto()
     NUMBER = auto()
     STRING = auto()
@@ -94,6 +95,7 @@ KEYWORDS = {
     "COMMIT": TokenType.COMMIT,
     "END": TokenType.END,
     "ROLLBACK": TokenType.ROLLBACK,
+    "ANALYZE": TokenType.ANALYZE,
 }
 
 

@@ -15,6 +15,14 @@ class AccessPath(str, Enum):
 
 
 @dataclass(frozen=True)
+class PlanAlternative:
+    name: str
+    estimated_cost: float
+    estimated_rows: float
+
+
+
+@dataclass(frozen=True)
 class AggregateSpec:
     function: AggregateFunction
     column_index: int | None
@@ -65,6 +73,11 @@ class CreateIndexPlan:
 
 
 @dataclass(frozen=True)
+class AnalyzePlan:
+    table: str | None = None
+
+
+@dataclass(frozen=True)
 class InsertPlan:
     schema: TableSchema
     values: tuple[Any, ...]
@@ -81,6 +94,9 @@ class SelectPlan:
     order_by: OrderSpec | None = None
     limit: int | None = None
     aggregates: tuple[AggregateSpec, ...] = ()
+    estimated_rows: float | None = None
+    estimated_cost: float | None = None
+    alternatives: tuple[PlanAlternative, ...] = ()
 
     @property
     def is_aggregate(self) -> bool:
@@ -102,6 +118,10 @@ class JoinSelectPlan:
     order_by: OrderSpec | None = None
     limit: int | None = None
     aggregates: tuple[AggregateSpec, ...] = ()
+    outer_side: int = 0  # 0 = SQL-left outer, 1 = SQL-right outer
+    estimated_rows: float | None = None
+    estimated_cost: float | None = None
+    alternatives: tuple[PlanAlternative, ...] = ()
 
     @property
     def is_aggregate(self) -> bool:
@@ -132,6 +152,7 @@ class UpdatePlan:
 Plan = (
     CreateTablePlan
     | CreateIndexPlan
+    | AnalyzePlan
     | InsertPlan
     | SelectPlan
     | JoinSelectPlan

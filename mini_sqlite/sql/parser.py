@@ -4,6 +4,7 @@ from mini_sqlite.catalog.schema import Column, ColumnType
 from mini_sqlite.errors import ParseError
 from mini_sqlite.sql.ast import (
     AggregateExpr,
+    AnalyzeStmt,
     AggregateFunction,
     Assignment,
     BeginStmt,
@@ -43,6 +44,8 @@ class Parser:
             stmt = self._delete()
         elif token_type == TokenType.UPDATE:
             stmt = self._update()
+        elif token_type == TokenType.ANALYZE:
+            stmt = self._analyze()
         elif token_type == TokenType.BEGIN:
             stmt = self._begin()
         elif token_type in (TokenType.COMMIT, TokenType.END):
@@ -98,6 +101,13 @@ class Parser:
             self._advance()
             return None
         raise self._error("expected literal")
+
+    def _analyze(self) -> AnalyzeStmt:
+        self._expect(TokenType.ANALYZE)
+        table = None
+        if self.current.type == TokenType.IDENT:
+            table = self._ident()
+        return AnalyzeStmt(table)
 
     def _begin(self) -> BeginStmt:
         self._expect(TokenType.BEGIN)

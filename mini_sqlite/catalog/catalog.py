@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 
 from mini_sqlite.btree import BTree
 from mini_sqlite.catalog.schema import Column, ColumnType, IndexSchema, TableSchema
+from mini_sqlite.catalog.statistics import ColumnStats, TableStats
 from mini_sqlite.errors import SchemaError
 from mini_sqlite.index.secondary import SecondaryIndex
 from mini_sqlite.storage import RecordCodec
@@ -118,6 +120,42 @@ class Catalog:
         table.indexes.append(index_schema)
         self._save_table(table)
         return index_schema
+
+
+    def analyze(self, table_name: str | None = None) -> int:
+        """Collect exact statistics and persist them in catalog rows.
+
+        v0.8 deliberately performs a full scan so the relationship between data,
+        statistics, selectivity, and plan choice stays observable. Statistics are
+        snapshots: later writes do not silently refresh them; run ANALYZE again.
+        """
+        tables = [self.get_table(table_name)] if table_name is not None else self.list_tables()
+        analyzed = 0
+        for table in tables:
+            tree = BTree(self.pager, table.root_page)
+            values_by_column: list[list[object]] = [[] for _ in table.columns]
+            row_count = 0
+            for _rowid, raw in tree.scan():
+                row = RecordCodec.decode(raw)
+                row_count += 1
+                for i, value in enumerate(row):
+                    values_by_column[i].append(value)
+
+            column_stats: dict[str, ColumnStats] = {}
+            for column, values in zip(table.columns, values_by_column):
+                non_null = [value for value in values if value is not None]
+                counts = Counter(non_null)
+                column_stats[column.name] = ColumnStats(
+                    null_count=len(values) - len(non_null),
+                    distinct_count=len(counts),
+                    min_value=min(non_null) if non_null else None,
+                    max_value=max(non_null) if non_null else None,
+                    most_common=counts.most_common(16),
+                )
+            table.stats = TableStats(row_count=row_count, columns=column_stats)
+            self._save_table(table)
+            analyzed += 1
+        return analyzed
 
     def update_root_page(self, table_id: int, root_page: int) -> None:
         schema = self._get_table_by_id(table_id)

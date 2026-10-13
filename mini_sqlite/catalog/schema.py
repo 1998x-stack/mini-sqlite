@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from mini_sqlite.errors import SchemaError
+from mini_sqlite.catalog.statistics import TableStats
 
 
 class ColumnType(str, Enum):
@@ -34,6 +35,7 @@ class TableSchema:
     root_page: int
     columns: list[Column] = field(default_factory=list)
     indexes: list[IndexSchema] = field(default_factory=list)
+    stats: TableStats | None = None
 
     @property
     def primary_key_index(self) -> int:
@@ -121,6 +123,7 @@ class TableSchema:
                 }
                 for index in self.indexes
             ],
+            "stats": self.stats.encode() if self.stats is not None else None,
         }
         return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -150,4 +153,5 @@ class TableSchema:
                 )
                 for i in obj.get("indexes", [])
             ],
+            stats=TableStats.decode(obj.get("stats")),
         )
