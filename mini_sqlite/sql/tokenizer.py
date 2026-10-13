@@ -28,9 +28,25 @@ class Tokenizer:
             if ch in ("'", '"'):
                 tokens.append(self._string(ch))
                 continue
+
+            # Comparison operators are checked before one-character tokens.
+            two = ch + self._peek(1)
+            multi = {
+                "!=": TokenType.NE,
+                "<>": TokenType.NE,
+                "<=": TokenType.LE,
+                ">=": TokenType.GE,
+            }.get(two)
+            if multi is not None:
+                tokens.append(Token(multi, two, self.i))
+                self.i += 2
+                continue
+
             single = {
                 "*": TokenType.STAR,
                 "=": TokenType.EQ,
+                "<": TokenType.LT,
+                ">": TokenType.GT,
                 ",": TokenType.COMMA,
                 "(": TokenType.LPAREN,
                 ")": TokenType.RPAREN,

@@ -1,95 +1,80 @@
 # mini-sqlite
 
-A small SQLite-inspired database engine for learning how a SQL database works from SQL text down to page bytes, indexes, and crash recovery.
+A small SQLite-inspired database engine for learning how SQL becomes page-backed execution, indexing, transactions, and relational row processing.
 
-`mini-sqlite` is **not** a wrapper around Python `sqlite3`. Persisted table/index state lives in page-backed B+Trees.
+`mini-sqlite` is **not** a wrapper around Python `sqlite3`. Persisted table/index state lives in B+Trees managed by a Pager.
 
-## Current version: v0.3 — secondary indexes + richer planner
+## Current version: v0.4 — Relational Execution Engine
 
 ```text
-SQL text
-   ↓
-Tokenizer / Parser
-   ↓
-AST
-   ↓
-Rule-based Planner
-   ├─ PRIMARY_KEY
-   ├─ SECONDARY_INDEX
-   └─ TABLE_SCAN
-   ↓
-Tiny bytecode Compiler
-   ↓
-Virtual Machine
-   ├─────────────┐
-   ▼             ▼
-Table Cursor   Index Cursor
-   │             │
-   ▼             ▼
-int-key B+Tree  byte-key B+Tree
-   └──────┬──────┘
-          ▼
-        Pager
-   ┌──────┴──────┐
-   ▼             ▼
-rollback journal database file
+SQL
+ ↓
+Parser / AST
+ ↓
+Planner
+ ├─ PRIMARY_KEY
+ ├─ SECONDARY_INDEX
+ └─ TABLE_SCAN
+ ↓
+Compiler / VM
+ ↓
+source -> filter -> collect -> sort -> aggregate/project -> limit -> emit
+ ↓
+Table / Index B+Trees
+ ↓
+Pager
+ ├─ rollback journal
+ └─ database file
 ```
 
-v0.1 established pages/B+Tree/SQL/VM. v0.2 added rollback-journal transactions and hot-journal recovery. v0.3 answers:
+Version progression:
 
-> Why can a secondary index turn a filter into logarithmic navigation, why does it still need a rowid lookup back into the table, and how do table + index stay transactionally consistent?
+```text
+v0.1  Page/Pager/B+Tree + SQL/Planner/VM
+v0.2  Rollback Journal + Crash Recovery
+v0.3  Secondary Index + Index Access Path
+v0.4  Relational Execution + UPDATE               ← current
+v0.5  JOIN                                         ← next
+```
 
-## v0.3 capabilities
+## v0.4 capabilities
 
-Foundation retained from v0.1/v0.2:
+Retained from earlier versions:
 
-- 4096-byte pages and page cache;
-- slotted table/catalog B+Tree pages;
+- fixed 4096-byte pages;
+- table/catalog and secondary-index B+Trees;
 - leaf/internal/root splits;
-- persistent catalog;
-- typed row codec (`NULL`, `INTEGER`, `TEXT`);
-- SQL tokenizer/parser/AST;
-- planner → bytecode compiler → VM;
-- `CREATE TABLE`, `INSERT`, `SELECT`, `DELETE`;
-- explicit/autocommit transactions;
-- before-image rollback journal;
-- hot-journal crash recovery.
+- persistent schema/index catalog;
+- rollback-journal transactions and hot-journal recovery;
+- primary-key lookup / secondary-index equality lookup / table scan;
+- `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT`, `DELETE`.
 
-New in v0.3:
+New in v0.4:
 
-- `CREATE INDEX idx ON table(column)`;
-- persistent index metadata;
-- variable-length byte-key B+Tree pages;
-- `(indexed_value, rowid)` composite physical keys;
-- duplicate secondary-key support;
-- INTEGER/TEXT/NULL index key encoding;
-- build index over pre-existing rows;
-- planner choice among primary-key seek, secondary-index seek, and table scan;
-- explicit index-to-table rowid lookup in VM bytecode;
-- INSERT/DELETE maintenance of every index in the same transaction;
-- index root split persistence;
-- rollback/crash recovery covering table + indexes atomically;
-- `.indexes` / `.index INDEX` inspection.
+- `UPDATE`;
+- `= != < <= > >=` predicates;
+- `ORDER BY ... ASC/DESC`;
+- `LIMIT`;
+- `COUNT(*)`, `COUNT(column)`, `SUM`, `MIN`, `MAX`;
+- explicit VM relational stages;
+- UPDATE maintenance of every secondary index in one transaction.
 
-## Install
+## Install and validate
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
-```
 
-## Validate
-
-```bash
 python -m pytest -q
 python examples/quickstart.py
 python examples/transactions.py
 python examples/indexes.py
+python examples/relational.py
 python -m compileall -q mini_sqlite
 ```
 
-## Quick index session
+## Relational example
 
 ```sql
 CREATE TABLE users (
@@ -98,94 +83,101 @@ CREATE TABLE users (
     age INTEGER
 );
 
-INSERT INTO users VALUES (1, 'Alice', 20);
-INSERT INTO users VALUES (2, 'Bob', 25);
-INSERT INTO users VALUES (3, 'Carol', 20);
+CREATE INDEX idx_users_age ON users(age);
+
+SELECT name
+FROM users
+WHERE age >= 20
+ORDER BY age DESC
+LIMIT 3;
 ```
 
-Before an index:
+Planner output is intentionally explainable:
 
 ```text
-mini-sqlite> .explain SELECT name FROM users WHERE age = 20;
 SELECT FROM users USING TABLE SCAN
+| FILTER age >= 20
+| SORT age DESC
+| PROJECT name
+| LIMIT 3
 ```
 
-Create the index:
+Why a table scan despite `idx_users_age`? v0.3's index cursor supports equality lookup only. v0.4 refuses to disguise a range scan as an index capability it does not yet have.
+
+For equality:
 
 ```sql
-CREATE INDEX idx_users_age ON users(age);
+SELECT name FROM users WHERE age = 35;
 ```
 
-Now:
+the plan still uses:
 
 ```text
-mini-sqlite> .explain SELECT name FROM users WHERE age = 20;
-SELECT FROM users USING SECONDARY INDEX idx_users_age ON age -> ROWID LOOKUP
+SECONDARY INDEX idx_users_age ON age -> ROWID LOOKUP
 ```
 
-The query still returns table rows:
+## Bytecode exposes the relational pipeline
+
+For a scan/sort/project/limit query, `.bytecode` contains stages like:
 
 ```text
-Alice
-Carol
+OPEN_READ
+REWIND
+FILTER_COMPARE
+COLLECT_ROW
+NEXT
+SORT_ROWS
+PROJECT_ROWS
+LIMIT_ROWS
+EMIT_ROWS
+HALT
 ```
 
-because the index yields rowids, then the VM seeks the table B+Tree.
+For aggregates:
 
-## Bytecode makes the back-to-table lookup visible
+```sql
+SELECT COUNT(*), SUM(age), MIN(age), MAX(age) FROM users;
+```
+
+`AGGREGATE_ROWS` replaces ordinary projection.
+
+This is the v0.4 core idea: query processing is a composition of explicit mechanisms rather than a growing collection of statement-specific branches.
+
+## UPDATE and indexes
+
+```sql
+UPDATE users SET age = 36 WHERE age = 35;
+```
+
+If `age` has an index, the old index can find matching rowids. Each matching row is changed as one transactional unit:
 
 ```text
-ADDR OPCODE             P1   P2   P3 P4
----- ---------------- ---- ---- ---- ------------------------------------------
-   0 OPEN_READ           0    0    0 'users'
-   1 OPEN_INDEX          1    0    0 'idx_users_age'
-   2 SEEK_INDEX_EQ       1    7    0 20
-   3 INDEX_TO_TABLE      1    0    0
-   4 PROJECT             0    0    0 [1]
-   5 RESULT_ROW          0    0    0
-   6 INDEX_NEXT          1    3    0
-   7 HALT                0    0    0
+remove old index entries
+        ↓
+replace table record
+        ↓
+insert new index entries
+        ↓
+commit through v0.2 rollback journal
 ```
 
-This is the v0.3 mental model in executable form:
+A crash cannot durably leave the table updated while its index still points at the old value.
+
+The INTEGER PRIMARY KEY cannot be changed in v0.4; that is an explicit version boundary.
+
+## Aggregate semantics
+
+Supported without GROUP BY:
 
 ```text
-index seek → rowid → table seek → row
+COUNT(*)
+COUNT(column)
+SUM(integer_column)
+MIN(column)
+MAX(column)
 ```
 
-## Why duplicate index values work
-
-For:
-
-```text
-(1, Alice, 20)
-(3, Carol, 20)
-```
-
-the secondary tree does not try to store two identical physical keys `20`. It stores:
-
-```text
-(20, 1)
-(20, 3)
-```
-
-`KeyCodec` encodes the indexed value as a byte prefix and appends an ordered rowid. Equality lookup seeks the shared prefix and walks only that duplicate run.
-
-## Transactional index maintenance
-
-An indexed INSERT is logically:
-
-```text
-insert table row
-      ↓
-insert idx_users_age entry
-      ↓
-insert any other index entries
-      ↓
-COMMIT one Pager transaction
-```
-
-A failure or crash does not leave “table changed but index stale”. Existing v0.2 rollback-journal rules restore all participating pages together.
+`COUNT(column)` ignores NULL. `SUM/MIN/MAX` ignore NULL and return NULL when no non-NULL input exists. Full SQL three-valued NULL logic is not implemented yet.
 
 ## Debug commands
 
@@ -196,15 +188,8 @@ A failure or crash does not leave “table changed but index stale”. Existing 
 .btree users
 .index idx_users_age
 .txn
-.explain SELECT * FROM users WHERE age = 20;
-.bytecode SELECT * FROM users WHERE age = 20;
-```
-
-`.pages` distinguishes table and index pages:
-
-```text
-LEAF / INTERNAL
-IDX_LEAF / IDX_INTERNAL
+.explain SELECT name FROM users WHERE age >= 20 ORDER BY age DESC LIMIT 3;
+.bytecode SELECT name FROM users WHERE age >= 20 ORDER BY age DESC LIMIT 3;
 ```
 
 ## Source map
@@ -212,60 +197,51 @@ IDX_LEAF / IDX_INTERNAL
 ```text
 mini_sqlite/
 ├── database.py
-├── sql/                 SQL → AST
-├── planner/             AST → access path / logical plan
-├── vm/                  Plan → bytecode → execution
-├── catalog/             table + index metadata
-├── btree/               INTEGER-key table/catalog B+Tree
-├── index/
-│   ├── key_codec.py     SQL values → ordered byte prefixes
-│   ├── node.py          variable-key slotted index pages
-│   ├── btree.py         byte-key B+Tree
-│   ├── secondary.py     row/index mapping
-│   └── cursor.py        equality lookup → rowids
-├── storage/
-│   ├── pager.py
-│   ├── journal.py
-│   ├── record.py
-│   └── meta.py
-└── transaction/
+├── sql/                  SQL tokens / AST / parser
+├── planner/              access path + relational plan metadata
+├── vm/                   bytecode compiler + relational execution
+├── catalog/              table/index metadata
+├── btree/                INTEGER-key table/catalog tree
+├── index/                byte-key secondary-index tree
+├── storage/              Pager / journal / records / page-0 metadata
+└── transaction/          connection transaction state
 ```
 
 ## Recommended reading order
 
-For fundamentals:
+For foundations:
 
 1. `storage/record.py`
 2. `btree/node.py`
 3. `btree/btree.py`
 4. `storage/pager.py`
 5. `docs/TRANSACTIONS.md`
-
-For v0.3:
-
 6. `docs/INDEXES.md`
-7. `index/key_codec.py`
-8. `index/node.py`
-9. `index/btree.py`
-10. `index/secondary.py`
-11. `catalog/schema.py`
-12. `planner/planner.py`
-13. `vm/compiler.py`
-14. `vm/vm.py`
-15. `tests/test_indexes.py`
 
-## v0.3 explicit non-goals
+For v0.4:
 
-- UNIQUE indexes;
-- multi-column / expression / partial indexes;
-- range predicates and range index scans;
-- covering/index-only scans;
-- collation configuration;
-- statistics/selectivity/cost model;
-- `UPDATE`, `ORDER BY`, aggregates, `LIMIT`;
+7. `docs/RELATIONAL_ENGINE.md`
+8. `sql/ast.py`
+9. `sql/parser.py`
+10. `planner/plan.py`
+11. `planner/planner.py`
+12. `vm/compiler.py`
+13. `vm/vm.py`
+14. `tests/test_relational.py`
+
+## Explicit v0.4 non-goals
+
 - JOIN;
-- WAL;
-- concurrent connections / locking;
-- SQLite file-format compatibility.
+- GROUP BY / HAVING;
+- aliases / qualified columns;
+- AND / OR expression trees;
+- complete SQL NULL semantics;
+- arithmetic expressions in UPDATE;
+- INTEGER PRIMARY KEY UPDATE;
+- streaming LIMIT / external sort;
+- range index scans;
+- statistics / cost-based optimization;
+- WAL / concurrent connections;
+- SQLite binary compatibility.
 
-See `Plan.md`. The next milestone is **v0.4: Relational Execution Engine**.
+See `Plan.md`. The next milestone is **v0.5: JOIN**.

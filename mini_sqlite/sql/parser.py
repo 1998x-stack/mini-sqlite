@@ -3,16 +3,22 @@ from __future__ import annotations
 from mini_sqlite.catalog.schema import Column, ColumnType
 from mini_sqlite.errors import ParseError
 from mini_sqlite.sql.ast import (
+    AggregateExpr,
+    AggregateFunction,
+    Assignment,
     BeginStmt,
     CommitStmt,
+    ComparisonPredicate,
+    CompareOp,
     CreateIndexStmt,
     CreateTableStmt,
     DeleteStmt,
-    EqualityPredicate,
     InsertStmt,
+    OrderBy,
     RollbackStmt,
     SelectStmt,
     Statement,
+    UpdateStmt,
 )
 from mini_sqlite.sql.tokenizer import Tokenizer
 from mini_sqlite.sql.tokens import Token, TokenType
@@ -33,6 +39,8 @@ class Parser:
             stmt = self._select()
         elif token_type == TokenType.DELETE:
             stmt = self._delete()
+        elif token_type == TokenType.UPDATE:
+            stmt = self._update()
         elif token_type == TokenType.BEGIN:
             stmt = self._begin()
         elif token_type in (TokenType.COMMIT, TokenType.END):
@@ -141,18 +149,41 @@ class Parser:
         self._expect(TokenType.RPAREN)
         return InsertStmt(table, tuple(values))
 
+    def _select_item(self) -> str | AggregateExpr:
+        aggregate_tokens = {
+            TokenType.COUNT: AggregateFunction.COUNT,
+            TokenType.SUM: AggregateFunction.SUM,
+            TokenType.MIN: AggregateFunction.MIN,
+            TokenType.MAX: AggregateFunction.MAX,
+        }
+        function = aggregate_tokens.get(self.current.type)
+        if function is not None:
+            self._advance()
+            self._expect(TokenType.LPAREN)
+            if self._match(TokenType.STAR):
+                if function != AggregateFunction.COUNT:
+                    raise self._error(f"{function.value}(*) is not supported")
+                column = None
+            else:
+                column = self._ident()
+            self._expect(TokenType.RPAREN)
+            return AggregateExpr(function, column)
+        return self._ident()
+
     def _select(self) -> SelectStmt:
         self._expect(TokenType.SELECT)
         if self._match(TokenType.STAR):
-            columns = ["*"]
+            items: list[str | AggregateExpr] = ["*"]
         else:
-            columns = [self._ident()]
+            items = [self._select_item()]
             while self._match(TokenType.COMMA):
-                columns.append(self._ident())
+                items.append(self._select_item())
         self._expect(TokenType.FROM)
         table = self._ident()
         where = self._optional_where()
-        return SelectStmt(table, columns, where)
+        order_by = self._optional_order_by()
+        limit = self._optional_limit()
+        return SelectStmt(table, items, where, order_by, limit)
 
     def _delete(self) -> DeleteStmt:
         self._expect(TokenType.DELETE)
@@ -161,9 +192,56 @@ class Parser:
         where = self._optional_where()
         return DeleteStmt(table, where)
 
-    def _optional_where(self) -> EqualityPredicate | None:
+    def _update(self) -> UpdateStmt:
+        self._expect(TokenType.UPDATE)
+        table = self._ident()
+        self._expect(TokenType.SET)
+        assignments = [self._assignment()]
+        while self._match(TokenType.COMMA):
+            assignments.append(self._assignment())
+        where = self._optional_where()
+        return UpdateStmt(table, tuple(assignments), where)
+
+    def _assignment(self) -> Assignment:
+        column = self._ident()
+        self._expect(TokenType.EQ)
+        return Assignment(column, self._literal())
+
+    def _optional_where(self) -> ComparisonPredicate | None:
         if not self._match(TokenType.WHERE):
             return None
         column = self._ident()
-        self._expect(TokenType.EQ)
-        return EqualityPredicate(column, self._literal())
+        operators = {
+            TokenType.EQ: CompareOp.EQ,
+            TokenType.NE: CompareOp.NE,
+            TokenType.LT: CompareOp.LT,
+            TokenType.LE: CompareOp.LE,
+            TokenType.GT: CompareOp.GT,
+            TokenType.GE: CompareOp.GE,
+        }
+        op = operators.get(self.current.type)
+        if op is None:
+            raise self._error("expected comparison operator")
+        self._advance()
+        return ComparisonPredicate(column, op, self._literal())
+
+    def _optional_order_by(self) -> OrderBy | None:
+        if not self._match(TokenType.ORDER):
+            return None
+        self._expect(TokenType.BY)
+        column = self._ident()
+        descending = False
+        if self._match(TokenType.ASC):
+            descending = False
+        elif self._match(TokenType.DESC):
+            descending = True
+        return OrderBy(column, descending)
+
+    def _optional_limit(self) -> int | None:
+        if not self._match(TokenType.LIMIT):
+            return None
+        token = self._expect(TokenType.NUMBER)
+        limit = int(token.value)
+        if limit < 0:
+            raise self._error("LIMIT must be non-negative")
+        return limit

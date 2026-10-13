@@ -25,5 +25,7 @@ jobs:
         run: python examples/transactions.py
       - name: Smoke indexes
         run: python examples/indexes.py
+      - name: Smoke relational engine
+        run: python examples/relational.py
       - name: Compile package
         run: python -m compileall -q mini_sqlite

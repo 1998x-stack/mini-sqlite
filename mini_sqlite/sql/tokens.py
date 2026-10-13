@@ -16,6 +16,17 @@ class TokenType(Enum):
     FROM = auto()
     WHERE = auto()
     DELETE = auto()
+    UPDATE = auto()
+    SET = auto()
+    ORDER = auto()
+    BY = auto()
+    ASC = auto()
+    DESC = auto()
+    LIMIT = auto()
+    COUNT = auto()
+    SUM = auto()
+    MIN = auto()
+    MAX = auto()
     PRIMARY = auto()
     KEY = auto()
     INTEGER = auto()
@@ -31,6 +42,11 @@ class TokenType(Enum):
     STRING = auto()
     STAR = auto()
     EQ = auto()
+    NE = auto()
+    LT = auto()
+    LE = auto()
+    GT = auto()
+    GE = auto()
     COMMA = auto()
     LPAREN = auto()
     RPAREN = auto()
@@ -50,6 +66,17 @@ KEYWORDS = {
     "FROM": TokenType.FROM,
     "WHERE": TokenType.WHERE,
     "DELETE": TokenType.DELETE,
+    "UPDATE": TokenType.UPDATE,
+    "SET": TokenType.SET,
+    "ORDER": TokenType.ORDER,
+    "BY": TokenType.BY,
+    "ASC": TokenType.ASC,
+    "DESC": TokenType.DESC,
+    "LIMIT": TokenType.LIMIT,
+    "COUNT": TokenType.COUNT,
+    "SUM": TokenType.SUM,
+    "MIN": TokenType.MIN,
+    "MAX": TokenType.MAX,
     "PRIMARY": TokenType.PRIMARY,
     "KEY": TokenType.KEY,
     "INTEGER": TokenType.INTEGER,

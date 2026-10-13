@@ -11,11 +11,24 @@ class OpCode(Enum):
     SEEK_PK = auto()
     SEEK_INDEX_EQ = auto()
     INDEX_TO_TABLE = auto()
+
+    # v0.1-v0.3 row-at-a-time instructions remain readable for historical code.
     FILTER_EQ = auto()
     PROJECT = auto()
     RESULT_ROW = auto()
+
+    # v0.4 relational pipeline instructions.
+    FILTER_COMPARE = auto()
+    COLLECT_ROW = auto()
+    SORT_ROWS = auto()
+    PROJECT_ROWS = auto()
+    AGGREGATE_ROWS = auto()
+    LIMIT_ROWS = auto()
+    EMIT_ROWS = auto()
+
     NEXT = auto()
     INDEX_NEXT = auto()
     INSERT_ROW = auto()
+    UPDATE_CURRENT = auto()
     DELETE_CURRENT = auto()
     HALT = auto()

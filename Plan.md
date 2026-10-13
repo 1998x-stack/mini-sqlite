@@ -1,6 +1,6 @@
 # mini-sqlite — Architecture-Driven Development Plan
 
-> Canonical roadmap for `main`.
+> Canonical roadmap.
 >
 > **Invariant:** `main` is always the newest integrated, validated state. Version branches are readable learning snapshots. One version introduces one dominant database mental model.
 
@@ -36,181 +36,181 @@ concurrency
 
 ### v0.1 — Page-backed B+Tree + SQL → Planner → VM ✅
 
-Implemented:
-
 - 4 KiB Pager;
-- slotted leaf/internal pages;
-- B+Tree search/insert/delete/scan/splits;
-- RecordCodec;
+- slotted table/catalog B+Tree;
+- search/insert/delete/scan/splits;
+- typed record codec;
 - persistent catalog;
 - tokenizer/parser/AST;
 - rule planner;
 - tiny VDBE-inspired VM;
-- primary-key seek vs full scan;
-- CREATE TABLE / INSERT / SELECT / DELETE;
-- inspection commands.
+- PK seek vs table scan;
+- CREATE TABLE / INSERT / SELECT / DELETE.
 
 ### v0.2 — Rollback-journal transactions + crash recovery ✅
 
-Implemented:
-
 - BEGIN / COMMIT / ROLLBACK;
-- write autocommit;
+- autocommit writes;
 - before-image journal;
-- one-before-image-per-old-page rule;
-- original-page-count truncation;
-- journal fsync → DB write/fsync → journal deletion;
+- journal-first fsync ordering;
 - hot-journal startup recovery;
-- rollback across B+Tree/catalog/meta root changes;
-- Python transaction context manager;
-- fault/crash tests.
+- truncation of transaction-created pages;
+- rollback across tree/catalog/meta root changes.
 
 ### v0.3 — Secondary indexes + richer planner ✅
 
+- CREATE INDEX;
+- persistent IndexSchema;
+- byte-key secondary-index B+Tree;
+- typed composite `(value,rowid)` keys;
+- duplicate equality runs;
+- planner PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN;
+- explicit index-to-table rowid lookup;
+- transactional INSERT/DELETE index maintenance;
+- crash recovery across table + indexes.
+
+### v0.4 — Relational Execution Engine ✅
+
 Central question:
 
-> How can a secondary index provide a different ordered access path while INSERT/DELETE and crash recovery keep table and index state atomically consistent?
+> How should SQL row processing compose as explicit execution mechanisms instead of accumulating statement-specific special cases?
 
 Implemented:
 
-- `CREATE INDEX name ON table(column)`;
-- persistent `IndexSchema` in table metadata;
-- byte-key index B+Tree with slotted leaf/internal pages;
-- `KeyCodec` for INTEGER/TEXT/NULL;
-- `(indexed_value, rowid)` physical composite keys;
-- duplicate-key equality runs;
-- existing-row index build;
-- index root split persistence;
-- planner `PRIMARY_KEY / SECONDARY_INDEX / TABLE_SCAN` paths;
-- VM `OPEN_INDEX / SEEK_INDEX_EQ / INDEX_TO_TABLE / INDEX_NEXT`;
-- transactional INSERT/DELETE index maintenance;
-- rollback and hot-journal recovery across table + index;
-- index inspection and educational example.
+- UPDATE with type validation and fixed INTEGER PRIMARY KEY identity;
+- comparison predicates `= != < <= > >=`;
+- ORDER BY ASC/DESC;
+- LIMIT;
+- COUNT / SUM / MIN / MAX;
+- explicit VM stages `FILTER_COMPARE / COLLECT_ROW / SORT_ROWS / PROJECT_ROWS / AGGREGATE_ROWS / LIMIT_ROWS / EMIT_ROWS`;
+- full-row sort before projection;
+- equality index paths preserved while range predicates correctly fall back to scans;
+- UPDATE maintenance of all secondary indexes;
+- rollback and hot-journal recovery for UPDATE;
+- relational execution documentation and example.
 
-## 3. Current next milestone — v0.4 Relational Execution Engine 🎯
+## 3. Current next milestone — v0.5 JOIN 🎯
 
 ### Central question
 
-> How should SQL relational operations compose as execution mechanisms instead of accumulating statement-specific special cases inside the VM?
+> How can two row sources be composed while keeping name resolution, physical access paths, and join algorithms explicit?
 
-v0.3 now has multiple access paths. Before JOIN or cost optimization, the engine needs richer row-processing operators.
+v0.4 now has a visible single-source relational pipeline. JOIN is the next mechanism because it forces the engine to compose multiple sources rather than merely transform one source.
 
 ### Target architecture
 
 ```text
-SQL / AST
-    ↓
-Planner
-    ↓
-logical plan
-    ↓
-access source
-(table / PK / index)
-    ↓
-Filter
-    ↓
-Projection
-    ↓
-Sort / Limit / Aggregate
-    ↓
-Result
+                 logical join
+                 /          \
+          left source     right source
+             │               │
+      scan/PK/index      scan/PK/index
+             \               /
+              \             /
+               join operator
+                    ↓
+                  filter
+                    ↓
+                projection
+                    ↓
+             sort / limit
+                    ↓
+                  result
 ```
 
-The exact implementation may remain bytecode-oriented, but operator boundaries must be explicit enough that v0.5 JOIN can compose with them.
+### v0.5.1 aliases and qualified names
 
-### v0.4.1 UPDATE
-
-Add:
+Support enough name resolution for unambiguous joins:
 
 ```sql
-UPDATE users SET age = 21 WHERE id = 1;
+SELECT u.name, o.total
+FROM users u
+JOIN orders o ON u.id = o.user_id;
 ```
 
 Requirements:
 
-- reuse access-path planning;
-- validate assignment types;
-- if an indexed column changes, remove old index key and insert new index key in the same transaction;
-- primary-key updates may be an explicit non-goal if they obscure the version.
+- table aliases;
+- qualified column references;
+- clear ambiguous-column errors;
+- keep name binding in Planner/schema resolution, not storage.
 
-### v0.4.2 richer expressions
+### v0.5.2 INNER JOIN
 
-At minimum consider:
-
-```text
-=
-!=
-<
-<=
->
->=
-AND
-```
-
-Keep expression evaluation separate from storage navigation. Do not yet build a full SQL expression engine.
-
-### v0.4.3 LIMIT
+Start with one explicit form:
 
 ```sql
-SELECT * FROM users LIMIT 10;
+FROM left JOIN right ON left.col = right.col
 ```
 
-LIMIT should stop upstream execution rather than materialize all rows first when practical.
+Do not add OUTER/CROSS/NATURAL joins until INNER JOIN mechanics are clear.
 
-### v0.4.4 ORDER BY
+### v0.5.3 nested-loop join reference path
 
-```sql
-SELECT * FROM users ORDER BY age;
-```
-
-Start with an explicit in-memory sort operator. Do not silently claim that a secondary index always satisfies ordering; that optimization belongs later.
-
-### v0.4.5 aggregates
-
-Start with:
+Implement the most readable baseline first:
 
 ```text
-COUNT
-SUM
-MIN
-MAX
+for left row:
+    for right row:
+        if join predicate:
+            emit combined row
 ```
 
-Make aggregate state explicit and test NULL behavior defined by mini-sqlite.
+This is the reference algorithm and correctness baseline.
 
-### v0.4.6 execution composition
+### v0.5.4 indexed nested-loop join
 
-Refactor only as much as necessary to make the flow visible:
+When the inner join column has a usable primary/secondary equality index:
 
 ```text
-source → filter → project → aggregate/sort/limit
+outer row
+   ↓
+extract join key
+   ↓
+seek inner PK/index
+   ↓
+matching rows
 ```
 
-Avoid premature iterator-framework complexity if a small VM-compatible operator boundary is clearer.
+Planner should expose why the indexed path was chosen. Do not add cost estimates yet; a rule-based choice is enough.
 
-### Definition of Done for v0.4
+### v0.5.5 join bytecode / operator visibility
+
+The execution model should make the join mechanism visible, for example:
+
+```text
+OPEN_LEFT
+OPEN_RIGHT
+REWIND_LEFT
+REWIND_RIGHT / SEEK_INNER
+JOIN_COMPARE
+...
+```
+
+or an equally clear relational operator representation. Do not hide the complete join in one opaque helper.
+
+### v0.5.6 optional teaching comparison: hash join
+
+A small in-memory hash join may be added only after nested-loop correctness is complete, to contrast algorithmic trade-offs. It is not required for v0.5 completion.
+
+### Definition of Done for v0.5
 
 Tests should prove:
 
-- UPDATE works for scanned/PK/indexed predicates;
-- indexed-column UPDATE maintains indexes atomically;
-- LIMIT stops correctly;
-- ORDER BY returns deterministic ordering;
-- COUNT/SUM/MIN/MAX work on supported types;
-- expression/error semantics are documented;
-- v0.3 index path remains visible in EXPLAIN;
-- rollback/crash behavior remains correct;
-- full v0.1–v0.3 regression stays green.
+- aliases and qualified names resolve correctly;
+- ambiguous columns fail clearly;
+- INNER JOIN works with duplicate matches;
+- nested-loop join is correct;
+- indexed nested-loop join is planner-visible and equivalent to nested loop;
+- downstream projection/filter/order/limit compose with joined rows;
+- transactions/storage/index behavior from v0.1-v0.4 remains unchanged;
+- full regression and exact branch-head CI pass.
 
-### Explicit non-goals for v0.4
+### Explicit non-goals for v0.5
 
-No JOIN, subqueries, GROUP BY/HAVING, window functions, sophisticated NULL three-valued logic, external sort, statistics, WAL, or concurrency.
+No LEFT/RIGHT/FULL OUTER JOIN, GROUP BY/HAVING, subqueries, join reordering, cost-based join optimization, spill-to-disk hash tables, WAL, or concurrency.
 
 ## 4. Future milestones
-
-### v0.5 — JOIN
-
-Qualified names, aliases, INNER JOIN, nested-loop join, indexed nested-loop join; optional teaching-only hash join comparison.
 
 ### v0.6 — WAL
 
@@ -230,7 +230,7 @@ Connection abstraction, shared/reserved/pending/exclusive locks, busy timeout, c
 
 ### v1.0 — Educationally complete mini SQLite
 
-Durable rollback/WAL modes, primary/secondary indexes, basic relational operators and joins, bounded page cache, explainable planning, crash tests, documented formats, benchmark/inspection tooling.
+Durable rollback/WAL modes, primary/secondary indexes, relational operators and joins, bounded page cache, explainable planning, crash tests, documented formats, benchmark/inspection tooling.
 
 ## 5. Version-development protocol
 
@@ -239,17 +239,17 @@ read main/Agents.md + Plan.md + version.md
         ↓
 create vX.Y from latest main
         ↓
-write version boundary/docs
+write branch version.md + Agents.md
         ↓
-implement smallest readable mechanism
+implement smallest readable reference mechanism
         ↓
-add invariant/error/persistence/crash tests
+add invariant/error/persistence/crash tests as relevant
         ↓
-add educational example
+add educational example + architecture docs
         ↓
 run full regression
         ↓
-exact version branch CI green
+exact final version-branch CI green
         ↓
 freeze version branch
         ↓
@@ -257,9 +257,9 @@ integrate same validated engine tree into main
         ↓
 restore canonical main Agents.md/version.md
         ↓
-advance Plan.md
+advance roadmap
 ```
 
 ## 6. Compatibility policy
 
-Before v1.0, Python APIs may evolve between minor versions. Existing page formats should remain readable when practical. Additive metadata/page types must be documented. Any incompatible byte-layout change requires `FORMAT_VERSION` review, reopen tests, and an explicit compatibility/migration statement.
+Before v1.0, Python APIs may evolve between minor versions. Existing page formats should remain readable when practical. Any incompatible byte-layout change requires `FORMAT_VERSION` review, reopen tests, and an explicit compatibility/migration statement.
