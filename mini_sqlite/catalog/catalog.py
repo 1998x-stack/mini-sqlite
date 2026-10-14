@@ -11,6 +11,7 @@ from mini_sqlite.index.node import IndexNode
 from mini_sqlite.index.secondary import SecondaryIndex
 from mini_sqlite.storage import RecordCodec
 from mini_sqlite.storage.meta import DatabaseMeta
+from mini_sqlite.constants import FORMAT_VERSION
 from mini_sqlite.storage.pager import Pager
 
 MetaUpdate = Callable[[DatabaseMeta], None]
@@ -83,7 +84,7 @@ class Catalog:
                 return table, index
         raise SchemaError(f"no such index: {name}")
 
-    def create_index(self, name: str, table_name: str, column_name: str) -> IndexSchema:
+    def create_index(self, name: str, table_name: str, column_names) -> IndexSchema:
         try:
             self.get_index(name)
         except SchemaError:
@@ -92,18 +93,35 @@ class Catalog:
             raise SchemaError(f"index already exists: {name}")
 
         table = self.get_table(table_name)
-        column = table.column(column_name)
-        if table.index_on_column(column.name) is not None:
-            existing = table.index_on_column(column.name)
-            assert existing is not None
+        if isinstance(column_names, str):
+            requested = (column_names,)
+        else:
+            requested = tuple(column_names)
+        if not requested:
+            raise SchemaError("CREATE INDEX requires at least one column")
+        canonical = tuple(table.column(name).name for name in requested)
+        if len(canonical) > 1:
+            # Composite index metadata changes the catalog interpretation. Persist
+            # format v3 before making that schema reachable so older engines fail
+            # loudly instead of treating the index as single-column.
+            self.meta.version = FORMAT_VERSION
+            self._persist_meta(self.meta)
+        if len({name.lower() for name in canonical}) != len(canonical):
+            raise SchemaError("index column list contains duplicates")
+        existing = table.index_on_columns(canonical)
+        if existing is not None:
             raise SchemaError(
-                f"column {table.name}.{column.name} already has index {existing.name}"
+                f"columns {table.name}({', '.join(canonical)}) already have index {existing.name}"
             )
 
         table_tree = BTree(self.pager, table.root_page)
-        decoded_rows = ((rowid, RecordCodec.decode(raw)) for rowid, raw in table_tree.scan())
-        index_schema = IndexSchema(name=name, column=column.name, root_page=0, unique=False)
+        decoded_rows = (
+            (rowid, RecordCodec.decode(raw)) for rowid, raw in table_tree.scan()
+        )
+        index_schema = IndexSchema(name=name, columns=canonical, root_page=0, unique=False)
 
+        # During initial build, root changes update the local schema object. The
+        # table catalog row is written only after all existing rows are indexed.
         def root_changed(root_page: int) -> None:
             index_schema.root_page = root_page
 
@@ -117,6 +135,7 @@ class Catalog:
         table.indexes.append(index_schema)
         self._save_table(table)
         return index_schema
+
 
     def _index_tree_pages(self, root_page: int) -> list[int]:
         pages: list[int] = []
@@ -137,8 +156,9 @@ class Catalog:
     def reindex(self, index_name: str | None = None) -> int:
         """Rebuild one or every secondary index into fresh B+Tree pages.
 
-        The new root is persisted before the old tree is returned to Pager's
-        free-list. The surrounding transaction makes the ownership transfer atomic.
+        Old index pages become unreachable and are intentionally left for VACUUM.
+        The caller owns the surrounding transaction, so a failed rebuild truncates
+        newly allocated pages and restores the previous catalog root atomically.
         """
         names = [index_name] if index_name is not None else [
             index.name for _table, index in self.list_indexes()
@@ -151,7 +171,7 @@ class Catalog:
             rows = ((rowid, RecordCodec.decode(raw)) for rowid, raw in table_tree.scan())
             replacement = IndexSchema(
                 name=old.name,
-                column=old.column,
+                columns=old.columns,
                 root_page=0,
                 unique=old.unique,
             )
@@ -176,7 +196,12 @@ class Catalog:
         return rebuilt
 
     def analyze(self, table_name: str | None = None) -> int:
-        """Collect exact statistics and persist them in catalog rows."""
+        """Collect exact statistics and persist them in catalog rows.
+
+        v0.8 deliberately performs a full scan so the relationship between data,
+        statistics, selectivity, and plan choice stays observable. Statistics are
+        snapshots: later writes do not silently refresh them; run ANALYZE again.
+        """
         tables = [self.get_table(table_name)] if table_name is not None else self.list_tables()
         analyzed = 0
         for table in tables:
@@ -223,5 +248,7 @@ class Catalog:
         return TableSchema.decode(raw)
 
     def _save_table(self, schema: TableSchema) -> None:
+        # The educational catalog B+Tree has no general update operation yet;
+        # delete+insert is enough and keeps root-split handling visible.
         self.tree.delete(schema.table_id)
         self.tree.insert(schema.table_id, schema.encode())

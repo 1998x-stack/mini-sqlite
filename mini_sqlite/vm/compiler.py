@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from mini_sqlite.planner.indexing import find_equality
 from mini_sqlite.planner.plan import (
     AccessPath,
     CreateIndexPlan,
@@ -11,17 +12,13 @@ from mini_sqlite.planner.plan import (
     SelectPlan,
     UpdatePlan,
 )
+from mini_sqlite.sql.ast import ComparisonPredicate
 from mini_sqlite.vm.instruction import Instruction
 from mini_sqlite.vm.opcode import OpCode
 
 
 class Compiler:
-    """Compile logical plans to tiny VDBE-inspired bytecode.
-
-    v0.4 makes relational processing visible after row-source enumeration:
-
-        COLLECT_ROW -> SORT_ROWS -> AGGREGATE/PROJECT -> LIMIT_ROWS -> EMIT_ROWS
-    """
+    """Compile logical plans to tiny VDBE-inspired bytecode."""
 
     def compile(self, plan: Plan) -> list[Instruction]:
         if isinstance(plan, CreateTablePlan):
@@ -49,28 +46,49 @@ class Compiler:
         pipeline_jump_sites: list[int] = []
 
         if plan.access_path == AccessPath.PRIMARY_KEY:
-            assert plan.where is not None
-            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=0, p4=int(plan.where.value)))
-            pipeline_jump_sites.append(1)
+            key = find_equality(plan.where, plan.schema.primary_key.name)
+            assert key is not None
+            seek_addr = len(code)
+            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=0, p4=int(key)))
+            pipeline_jump_sites.append(seek_addr)
+            if plan.where is not None and not isinstance(plan.where, ComparisonPredicate):
+                filt = len(code)
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
+                pipeline_jump_sites.append(filt)
             code.append(Instruction(OpCode.COLLECT_ROW, p1=0))
 
-        elif plan.access_path == AccessPath.SECONDARY_INDEX:
-            assert plan.index is not None and plan.where is not None
+        elif plan.access_path in (AccessPath.SECONDARY_INDEX, AccessPath.SECONDARY_INDEX_RANGE):
+            assert plan.index is not None and plan.index_probe is not None
             code.append(Instruction(OpCode.OPEN_INDEX, p1=1, p4=plan.index.name))
             seek_addr = len(code)
-            code.append(Instruction(OpCode.SEEK_INDEX_EQ, p1=1, p2=0, p4=plan.where.value))
+            if plan.access_path == AccessPath.SECONDARY_INDEX:
+                value = plan.index_probe.equality_values[0]
+                code.append(Instruction(OpCode.SEEK_INDEX_EQ, p1=1, p2=0, p4=value))
+            else:
+                code.append(
+                    Instruction(OpCode.SEEK_INDEX_RANGE, p1=1, p2=0, p4=plan.index_probe)
+                )
             pipeline_jump_sites.append(seek_addr)
             loop_addr = len(code)
             code.append(Instruction(OpCode.INDEX_TO_TABLE, p1=1, p2=0))
+            filter_addr = -1
+            if plan.where is not None and not isinstance(plan.where, ComparisonPredicate):
+                filter_addr = len(code)
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
             code.append(Instruction(OpCode.COLLECT_ROW, p1=0))
+            next_addr = len(code)
             code.append(Instruction(OpCode.INDEX_NEXT, p1=1, p2=loop_addr))
+            if filter_addr >= 0:
+                ins = code[filter_addr]
+                code[filter_addr] = Instruction(ins.opcode, ins.p1, next_addr, ins.p3, ins.p4)
 
         else:
             rewind_addr = len(code)
             code.append(Instruction(OpCode.REWIND, p1=0, p2=0))
             pipeline_jump_sites.append(rewind_addr)
             loop_addr = len(code)
-            if plan.where is not None:
+            filter_addr = -1
+            if isinstance(plan.where, ComparisonPredicate):
                 filter_addr = len(code)
                 code.append(
                     Instruction(
@@ -81,19 +99,15 @@ class Compiler:
                         p4=plan.where,
                     )
                 )
-            else:
-                filter_addr = -1
+            elif plan.where is not None:
+                filter_addr = len(code)
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
             code.append(Instruction(OpCode.COLLECT_ROW, p1=0))
             next_addr = len(code)
             code.append(Instruction(OpCode.NEXT, p1=0, p2=loop_addr))
             if filter_addr >= 0:
-                code[filter_addr] = Instruction(
-                    OpCode.FILTER_COMPARE,
-                    p1=0,
-                    p2=next_addr,
-                    p3=plan.schema.column_index(plan.where.column),
-                    p4=plan.where,
-                )
+                ins = code[filter_addr]
+                code[filter_addr] = Instruction(ins.opcode, ins.p1, next_addr, ins.p3, ins.p4)
 
         pipeline_addr = len(code)
         for addr in pipeline_jump_sites:
@@ -113,12 +127,6 @@ class Compiler:
         return code
 
     def _join_select(self, plan: JoinSelectPlan) -> list[Instruction]:
-        """Compile one INNER JOIN while keeping the join algorithm visible.
-
-        The left table is the outer source. The right source is either rewound
-        for every outer row (plain nested loop), sought by primary key, or sought
-        through a secondary index. Post-join relational operators reuse v0.4.
-        """
         code: list[Instruction] = [
             Instruction(OpCode.OPEN_READ, p1=0, p4=plan.left_schema.name),
             Instruction(OpCode.OPEN_READ, p1=1, p4=plan.right_schema.name),
@@ -225,33 +233,61 @@ class Compiler:
             code.append(Instruction(OpCode.HALT))
             return code
         if plan.access_path == AccessPath.PRIMARY_KEY:
-            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=3, p4=int(plan.where.value)))
+            key = find_equality(plan.where, plan.schema.primary_key.name)
+            assert key is not None
+            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=4, p4=int(key)))
+            if not isinstance(plan.where, ComparisonPredicate):
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=4, p4=plan.where))
             code.append(Instruction(OpCode.DELETE_CURRENT, p1=0))
             code.append(Instruction(OpCode.HALT))
             return code
-        if plan.access_path == AccessPath.SECONDARY_INDEX:
-            assert plan.index is not None
+        if plan.access_path in (AccessPath.SECONDARY_INDEX, AccessPath.SECONDARY_INDEX_RANGE):
+            assert plan.index is not None and plan.index_probe is not None
             code.append(Instruction(OpCode.OPEN_INDEX, p1=1, p4=plan.index.name))
-            code.append(Instruction(OpCode.SEEK_INDEX_EQ, p1=1, p2=6, p4=plan.where.value))
+            seek_addr = len(code)
+            seek_op = (
+                OpCode.SEEK_INDEX_EQ
+                if plan.access_path == AccessPath.SECONDARY_INDEX
+                else OpCode.SEEK_INDEX_RANGE
+            )
+            seek_payload = (
+                plan.index_probe.equality_values[0]
+                if seek_op == OpCode.SEEK_INDEX_EQ
+                else plan.index_probe
+            )
+            code.append(Instruction(seek_op, p1=1, p2=0, p4=seek_payload))
+            loop_addr = len(code)
             code.append(Instruction(OpCode.INDEX_TO_TABLE, p1=1, p2=0))
+            filter_addr = -1
+            if not isinstance(plan.where, ComparisonPredicate):
+                filter_addr = len(code)
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
             code.append(Instruction(OpCode.DELETE_CURRENT, p1=0))
-            code.append(Instruction(OpCode.INDEX_NEXT, p1=1, p2=3))
+            next_addr = len(code)
+            code.append(Instruction(OpCode.INDEX_NEXT, p1=1, p2=loop_addr))
+            halt = len(code)
             code.append(Instruction(OpCode.HALT))
+            ins = code[seek_addr]
+            code[seek_addr] = Instruction(ins.opcode, ins.p1, halt, ins.p3, ins.p4)
+            if filter_addr >= 0:
+                ins = code[filter_addr]
+                code[filter_addr] = Instruction(ins.opcode, ins.p1, next_addr, ins.p3, ins.p4)
             return code
 
-        code.append(Instruction(OpCode.REWIND, p1=0, p2=5))
-        code.append(
-            Instruction(
-                OpCode.FILTER_COMPARE,
-                p1=0,
-                p2=4,
-                p3=plan.schema.column_index(plan.where.column),
-                p4=plan.where,
-            )
-        )
+        code.append(Instruction(OpCode.REWIND, p1=0, p2=0))
+        loop_addr = len(code)
+        filter_addr = len(code)
+        if isinstance(plan.where, ComparisonPredicate):
+            code.append(Instruction(OpCode.FILTER_COMPARE, p1=0, p2=0, p3=plan.schema.column_index(plan.where.column), p4=plan.where))
+        else:
+            code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
         code.append(Instruction(OpCode.DELETE_CURRENT, p1=0))
-        code.append(Instruction(OpCode.NEXT, p1=0, p2=2))
+        next_addr = len(code)
+        code.append(Instruction(OpCode.NEXT, p1=0, p2=loop_addr))
+        halt = len(code)
         code.append(Instruction(OpCode.HALT))
+        rw=code[1]; code[1]=Instruction(rw.opcode,rw.p1,halt,rw.p3,rw.p4)
+        flt=code[filter_addr]; code[filter_addr]=Instruction(flt.opcode,flt.p1,next_addr,flt.p3,flt.p4)
         return code
 
     def _update(self, plan: UpdatePlan) -> list[Instruction]:
@@ -263,33 +299,51 @@ class Compiler:
             code.append(Instruction(OpCode.HALT))
             return code
         if plan.access_path == AccessPath.PRIMARY_KEY:
-            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=3, p4=int(plan.where.value)))
+            key = find_equality(plan.where, plan.schema.primary_key.name)
+            assert key is not None
+            code.append(Instruction(OpCode.SEEK_PK, p1=0, p2=4, p4=int(key)))
+            if not isinstance(plan.where, ComparisonPredicate):
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=4, p4=plan.where))
             code.append(Instruction(OpCode.UPDATE_CURRENT, p1=0, p4=plan.assignments))
             code.append(Instruction(OpCode.HALT))
             return code
-        if plan.access_path == AccessPath.SECONDARY_INDEX:
-            assert plan.index is not None
+        if plan.access_path in (AccessPath.SECONDARY_INDEX, AccessPath.SECONDARY_INDEX_RANGE):
+            assert plan.index is not None and plan.index_probe is not None
             code.append(Instruction(OpCode.OPEN_INDEX, p1=1, p4=plan.index.name))
-            code.append(Instruction(OpCode.SEEK_INDEX_EQ, p1=1, p2=6, p4=plan.where.value))
+            seek_addr = len(code)
+            seek_op = OpCode.SEEK_INDEX_EQ if plan.access_path == AccessPath.SECONDARY_INDEX else OpCode.SEEK_INDEX_RANGE
+            payload = plan.index_probe.equality_values[0] if seek_op == OpCode.SEEK_INDEX_EQ else plan.index_probe
+            code.append(Instruction(seek_op, p1=1, p2=0, p4=payload))
+            loop_addr = len(code)
             code.append(Instruction(OpCode.INDEX_TO_TABLE, p1=1, p2=0))
+            filter_addr = -1
+            if not isinstance(plan.where, ComparisonPredicate):
+                filter_addr = len(code)
+                code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
             code.append(Instruction(OpCode.UPDATE_CURRENT, p1=0, p4=plan.assignments))
-            code.append(Instruction(OpCode.INDEX_NEXT, p1=1, p2=3))
+            next_addr = len(code)
+            code.append(Instruction(OpCode.INDEX_NEXT, p1=1, p2=loop_addr))
+            halt = len(code)
             code.append(Instruction(OpCode.HALT))
+            ins=code[seek_addr]; code[seek_addr]=Instruction(ins.opcode,ins.p1,halt,ins.p3,ins.p4)
+            if filter_addr >= 0:
+                ins=code[filter_addr]; code[filter_addr]=Instruction(ins.opcode,ins.p1,next_addr,ins.p3,ins.p4)
             return code
 
-        code.append(Instruction(OpCode.REWIND, p1=0, p2=5))
-        code.append(
-            Instruction(
-                OpCode.FILTER_COMPARE,
-                p1=0,
-                p2=4,
-                p3=plan.schema.column_index(plan.where.column),
-                p4=plan.where,
-            )
-        )
+        code.append(Instruction(OpCode.REWIND, p1=0, p2=0))
+        loop_addr = len(code)
+        filter_addr = len(code)
+        if isinstance(plan.where, ComparisonPredicate):
+            code.append(Instruction(OpCode.FILTER_COMPARE, p1=0, p2=0, p3=plan.schema.column_index(plan.where.column), p4=plan.where))
+        else:
+            code.append(Instruction(OpCode.FILTER_PREDICATE, p1=0, p2=0, p4=plan.where))
         code.append(Instruction(OpCode.UPDATE_CURRENT, p1=0, p4=plan.assignments))
-        code.append(Instruction(OpCode.NEXT, p1=0, p2=2))
+        next_addr = len(code)
+        code.append(Instruction(OpCode.NEXT, p1=0, p2=loop_addr))
+        halt = len(code)
         code.append(Instruction(OpCode.HALT))
+        rw=code[1]; code[1]=Instruction(rw.opcode,rw.p1,halt,rw.p3,rw.p4)
+        flt=code[filter_addr]; code[filter_addr]=Instruction(flt.opcode,flt.p1,next_addr,flt.p3,flt.p4)
         return code
 
     @staticmethod

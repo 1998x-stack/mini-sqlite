@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from mini_sqlite.catalog import Catalog, ColumnType, IndexSchema, TableSchema
 from mini_sqlite.errors import SchemaError
+from mini_sqlite.planner.indexing import choose_rule_access, render_predicate
 from mini_sqlite.planner.plan import (
     AccessPath,
     AggregateSpec,
@@ -23,8 +24,11 @@ from mini_sqlite.planner.plan import (
 from mini_sqlite.sql.ast import (
     AggregateExpr,
     AggregateFunction,
+    AndPredicate,
+    BetweenPredicate,
     CompareOp,
     ComparisonPredicate,
+    predicate_terms,
     CreateIndexStmt,
     CreateTableStmt,
     DeleteStmt,
@@ -69,8 +73,10 @@ class Planner:
             return CreateTablePlan(stmt.name, stmt.columns)
         if isinstance(stmt, CreateIndexStmt):
             table = self.catalog.get_table(stmt.table)
-            table.column(stmt.column)
-            return CreateIndexPlan(stmt.name, table.name, stmt.column)
+            canonical = tuple(table.column(name).name for name in stmt.columns)
+            if len({name.lower() for name in canonical}) != len(canonical):
+                raise SchemaError("index column list contains duplicates")
+            return CreateIndexPlan(stmt.name, table.name, canonical)
         if isinstance(stmt, InsertStmt):
             schema = self.catalog.get_table(stmt.table)
             schema.validate_row(stmt.values)
@@ -79,9 +85,9 @@ class Planner:
             return self._select(stmt)
         if isinstance(stmt, DeleteStmt):
             schema = self.catalog.get_table(stmt.table)
-            self._validate_predicate(schema, stmt.where)
-            path, index = self._choose_access_path(schema, stmt.where)
-            return DeletePlan(schema, stmt.where, path, index)
+            where = self._normalize_single_predicate(schema, schema.name, stmt.where)
+            path, index, probe = self._choose_access_path(schema, where)
+            return DeletePlan(schema, where, path, index, probe)
         if isinstance(stmt, UpdateStmt):
             return self._update(stmt)
         raise SchemaError(f"unsupported statement type: {type(stmt).__name__}")
@@ -95,12 +101,8 @@ class Planner:
         schema = self.catalog.get_table(stmt.table)
         visible_name = stmt.table_alias or schema.name
 
-        where = None
-        if stmt.where is not None:
-            bare = self._resolve_single_name(schema, visible_name, stmt.where.column)
-            schema.validate_literal(bare, stmt.where.value)
-            where = ComparisonPredicate(bare, stmt.where.op, stmt.where.value)
-        path, index = self._choose_access_path(schema, where)
+        where = self._normalize_single_predicate(schema, visible_name, stmt.where)
+        path, index, probe = self._choose_access_path(schema, where)
 
         aggregate_items = [item for item in stmt.items if isinstance(item, AggregateExpr)]
         column_items = [item for item in stmt.items if isinstance(item, str)]
@@ -149,6 +151,7 @@ class Planner:
             where=where,
             access_path=path,
             index=index,
+            index_probe=probe,
             order_by=order_by,
             limit=stmt.limit,
             aggregates=aggregates,
@@ -185,6 +188,10 @@ class Planner:
 
         where = None
         if stmt.where is not None:
+            if not isinstance(stmt.where, ComparisonPredicate):
+                raise SchemaError(
+                    "v1.3 composite/range WHERE is currently supported for single-table queries"
+                )
             resolved = self._resolve_join_column(
                 stmt.where.column, left_schema, right_schema, left_name, right_name
             )
@@ -265,7 +272,7 @@ class Planner:
 
     def _update(self, stmt: UpdateStmt) -> UpdatePlan:
         schema = self.catalog.get_table(stmt.table)
-        self._validate_predicate(schema, stmt.where)
+        where = self._normalize_single_predicate(schema, schema.name, stmt.where)
         seen: set[int] = set()
         assignments: list[AssignmentSpec] = []
         for assignment in stmt.assignments:
@@ -279,8 +286,8 @@ class Planner:
             assignments.append(
                 AssignmentSpec(column_index, schema.columns[column_index].name, assignment.value)
             )
-        path, index = self._choose_access_path(schema, stmt.where)
-        return UpdatePlan(schema, tuple(assignments), stmt.where, path, index)
+        path, index, probe = self._choose_access_path(schema, where)
+        return UpdatePlan(schema, tuple(assignments), where, path, index, probe)
 
     @staticmethod
     def _projection(schema: TableSchema, columns: list[str]) -> tuple[list[int], list[str]]:
@@ -288,11 +295,24 @@ class Planner:
         names = [schema.columns[i].name for i in indexes]
         return indexes, names
 
-    @staticmethod
-    def _validate_predicate(schema: TableSchema, where) -> None:
+    def _normalize_single_predicate(self, schema: TableSchema, visible_name: str, where):
         if where is None:
-            return
-        schema.validate_literal(where.column, where.value)
+            return None
+        normalized = []
+        for term in predicate_terms(where):
+            bare = self._resolve_single_name(schema, visible_name, term.column)
+            if isinstance(term, BetweenPredicate):
+                schema.validate_literal(bare, term.lower)
+                schema.validate_literal(bare, term.upper)
+                if term.lower is not None and term.upper is not None and term.lower > term.upper:
+                    raise SchemaError("BETWEEN lower bound must not exceed upper bound")
+                normalized.append(BetweenPredicate(bare, term.lower, term.upper))
+            else:
+                schema.validate_literal(bare, term.value)
+                normalized.append(ComparisonPredicate(bare, term.op, term.value))
+        if len(normalized) == 1:
+            return normalized[0]
+        return AndPredicate(tuple(normalized))
 
     @staticmethod
     def _resolve_single_name(schema: TableSchema, visible_name: str, ref: str) -> str:
@@ -357,15 +377,8 @@ class Planner:
         return matches[0]
 
     @staticmethod
-    def _choose_access_path(schema: TableSchema, where) -> tuple[AccessPath, IndexSchema | None]:
-        if where is None or where.op != CompareOp.EQ:
-            return AccessPath.TABLE_SCAN, None
-        if where.column.lower() == schema.primary_key.name.lower():
-            return AccessPath.PRIMARY_KEY, None
-        index = schema.index_on_column(where.column)
-        if index is not None:
-            return AccessPath.SECONDARY_INDEX, index
-        return AccessPath.TABLE_SCAN, None
+    def _choose_access_path(schema: TableSchema, where):
+        return choose_rule_access(schema, where)
 
     @staticmethod
     def _choose_join_inner_path(
@@ -384,7 +397,7 @@ class Planner:
         if isinstance(plan, CreateTablePlan):
             return f"CREATE TABLE {plan.name}"
         if isinstance(plan, CreateIndexPlan):
-            return f"CREATE INDEX {plan.name} ON {plan.table}({plan.column}) USING B+TREE"
+            return f"CREATE INDEX {plan.name} ON {plan.table}({', '.join(plan.columns)}) USING B+TREE"
         if isinstance(plan, InsertPlan):
             suffix = f" + {len(plan.schema.indexes)} SECONDARY INDEX(ES)" if plan.schema.indexes else ""
             return f"INSERT INTO {plan.schema.name} USING B+TREE PRIMARY KEY{suffix}"
@@ -423,8 +436,8 @@ class Planner:
             return " | ".join(parts)
         if isinstance(plan, SelectPlan):
             parts = [f"SELECT FROM {plan.schema.name} USING {Planner._path_text(plan)}"]
-            if plan.where is not None and plan.access_path == AccessPath.TABLE_SCAN:
-                parts.append(f"FILTER {plan.where.column} {plan.where.op.value} {plan.where.value!r}")
+            if plan.where is not None:
+                parts.append(f"FILTER {render_predicate(plan.where)}")
             if plan.order_by is not None:
                 parts.append(
                     f"SORT {plan.order_by.column_name} {'DESC' if plan.order_by.descending else 'ASC'}"
@@ -445,7 +458,10 @@ class Planner:
 
     @staticmethod
     def _path_text(plan: SelectPlan | DeletePlan | UpdatePlan) -> str:
-        if plan.access_path == AccessPath.SECONDARY_INDEX:
+        if plan.access_path in (AccessPath.SECONDARY_INDEX, AccessPath.SECONDARY_INDEX_RANGE):
             assert plan.index is not None
-            return f"SECONDARY INDEX {plan.index.name} ON {plan.index.column} -> ROWID LOOKUP"
+            columns = ",".join(plan.index.columns)
+            if plan.access_path == AccessPath.SECONDARY_INDEX_RANGE:
+                return f"SECONDARY INDEX RANGE {plan.index.name} ON ({columns}) -> ROWID LOOKUP"
+            return f"SECONDARY INDEX {plan.index.name} ON ({columns}) -> ROWID LOOKUP"
         return plan.access_path.value.upper()

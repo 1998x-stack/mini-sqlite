@@ -51,13 +51,10 @@ def test_comparison_predicates_and_range_scan(tmp_path):
     with Database(tmp_path / "compare.db") as db:
         seed_users(db)
         db.execute("CREATE INDEX idx_age ON users(age);")
-
-        # Equality still uses the v0.3 secondary index.
         assert "SECONDARY INDEX idx_age" in db.explain(
             "SELECT id FROM users WHERE age = 35;"
         )
-        # Range access is intentionally a scan until range index cursors exist.
-        assert "TABLE SCAN" in db.explain("SELECT id FROM users WHERE age >= 25;")
+        assert "SECONDARY INDEX RANGE idx_age" in db.explain("SELECT id FROM users WHERE age >= 25;")
 
         assert db.execute("SELECT id FROM users WHERE age != 35 ORDER BY id;").rows == [
             (1,),
@@ -85,8 +82,6 @@ def test_comparison_predicates_and_range_scan(tmp_path):
 def test_order_by_limit_and_hidden_sort_column(tmp_path):
     with Database(tmp_path / "sort.db") as db:
         seed_users(db)
-        # ORDER BY operates on full source rows before projection, so the sort
-        # column need not appear in the SELECT list.
         result = db.execute("SELECT name FROM users ORDER BY age DESC LIMIT 3;")
         assert result.columns == ["name"]
         assert result.rows == [("Bob",), ("Dave",), ("Carol",)]
@@ -142,7 +137,6 @@ def test_update_primary_key_and_range_paths(tmp_path):
         assert db.execute("SELECT id FROM users WHERE age = 35;").rows == [(4,)]
         assert db.execute("SELECT id FROM users WHERE age = 40;").rows == [(2,)]
 
-        # Range predicate uses a scan, but all secondary indexes must still stay valid.
         updated = db.execute("UPDATE users SET age = 30 WHERE age < 30;")
         assert updated.rowcount == 2
         assert db.execute("SELECT id FROM users WHERE age = 30 ORDER BY id;").rows == [(1,), (3,)]

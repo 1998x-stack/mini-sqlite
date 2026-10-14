@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mini_sqlite.catalog import IndexSchema, TableSchema
+from mini_sqlite.planner.indexing import choose_rule_access
 from mini_sqlite.planner.plan import AccessPath, PlanAlternative
-from mini_sqlite.sql.ast import CompareOp, ComparisonPredicate
+from mini_sqlite.sql.ast import (
+    BetweenPredicate,
+    CompareOp,
+    ComparisonPredicate,
+    Predicate,
+    predicate_terms,
+)
 
 
 @dataclass(frozen=True)
@@ -42,50 +49,53 @@ class CostModel:
     ROWID_LOOKUP_COST = 2.0
 
     def choose_access(
-        self, schema: TableSchema, where: ComparisonPredicate | None
+        self,
+        schema: TableSchema,
+        where: Predicate | None,
+        candidate_path: AccessPath | None = None,
+        candidate_index: IndexSchema | None = None,
     ) -> AccessChoice:
+        if candidate_path is None:
+            candidate_path, candidate_index, _probe = choose_rule_access(schema, where)
+
         if schema.stats is None:
-            path, index = self._legacy_access(schema, where)
-            return AccessChoice(path, index, self._fallback_rows(schema, where), 0.0, ())
+            return AccessChoice(
+                candidate_path,
+                candidate_index,
+                self._fallback_rows(schema, where),
+                0.0,
+                (),
+            )
 
         row_count = float(schema.stats.row_count)
         est_rows = self.estimate_filter_rows(schema, where)
         alternatives: list[tuple[AccessPath, IndexSchema | None, PlanAlternative]] = []
-
         scan_cost = max(1.0, row_count) * self.TABLE_ROW_COST
         alternatives.append(
-            (
-                AccessPath.TABLE_SCAN,
-                None,
-                PlanAlternative("TABLE SCAN", scan_cost, est_rows),
-            )
+            (AccessPath.TABLE_SCAN, None, PlanAlternative("TABLE SCAN", scan_cost, est_rows))
         )
 
-        if where is not None and where.op == CompareOp.EQ:
-            if where.column.lower() == schema.primary_key.name.lower():
-                alternatives.append(
-                    (
-                        AccessPath.PRIMARY_KEY,
-                        None,
-                        PlanAlternative("PRIMARY KEY", self.PK_SEEK_COST, min(1.0, est_rows)),
-                    )
+        if candidate_path == AccessPath.PRIMARY_KEY:
+            alternatives.append(
+                (
+                    AccessPath.PRIMARY_KEY,
+                    None,
+                    PlanAlternative("PRIMARY KEY", self.PK_SEEK_COST, min(1.0, est_rows)),
                 )
-            else:
-                index = schema.index_on_column(where.column)
-                if index is not None:
-                    index_cost = (
-                        self.INDEX_SEEK_COST
-                        + est_rows * (self.INDEX_MATCH_COST + self.ROWID_LOOKUP_COST)
-                    )
-                    alternatives.append(
-                        (
-                            AccessPath.SECONDARY_INDEX,
-                            index,
-                            PlanAlternative(
-                                f"SECONDARY INDEX {index.name}", index_cost, est_rows
-                            ),
-                        )
-                    )
+            )
+        elif candidate_path in (AccessPath.SECONDARY_INDEX, AccessPath.SECONDARY_INDEX_RANGE):
+            assert candidate_index is not None
+            index_cost = self.INDEX_SEEK_COST + est_rows * (
+                self.INDEX_MATCH_COST + self.ROWID_LOOKUP_COST
+            )
+            label = (
+                f"SECONDARY INDEX RANGE {candidate_index.name}"
+                if candidate_path == AccessPath.SECONDARY_INDEX_RANGE
+                else f"SECONDARY INDEX {candidate_index.name}"
+            )
+            alternatives.append(
+                (candidate_path, candidate_index, PlanAlternative(label, index_cost, est_rows))
+            )
 
         chosen = min(alternatives, key=lambda item: (item[2].estimated_cost, item[2].name))
         return AccessChoice(
@@ -103,7 +113,6 @@ class CostModel:
         left_column_index: int,
         right_column_index: int,
     ) -> JoinChoice:
-        # Without stats retain v0.5's written-left outer rule.
         if left.stats is None or right.stats is None:
             path, index = self._join_inner_path(right, right_column_index)
             return JoinChoice(0, path, index, self._fallback_join_rows(left, right), 0.0, ())
@@ -137,18 +146,39 @@ class CostModel:
             alternatives=tuple(item[3] for item in candidates),
         )
 
-    def estimate_filter_rows(
-        self, schema: TableSchema, where: ComparisonPredicate | None
-    ) -> float:
+    def estimate_filter_rows(self, schema: TableSchema, where: Predicate | None) -> float:
         if schema.stats is None:
             return self._fallback_rows(schema, where)
         rows = float(schema.stats.row_count)
-        if where is None:
+        if where is None or rows <= 0:
             return rows
-        stats = schema.stats.column(where.column)
+        selectivity = 1.0
+        for term in predicate_terms(where):
+            atom_rows = self._estimate_atom_rows(schema, term, rows)
+            selectivity *= max(0.0, min(1.0, atom_rows / rows))
+        return max(0.0, min(rows, rows * selectivity))
+
+    def _estimate_atom_rows(self, schema: TableSchema, where, rows: float) -> float:
+        stats = schema.stats.column(where.column) if schema.stats is not None else None
         if stats is None or rows <= 0:
             return rows * 0.25
         non_null = max(0.0, rows - float(stats.null_count))
+        if isinstance(where, BetweenPredicate):
+            if where.lower is None or where.upper is None:
+                return 0.0
+            if (
+                isinstance(where.lower, int)
+                and isinstance(where.upper, int)
+                and isinstance(stats.min_value, int)
+                and isinstance(stats.max_value, int)
+                and stats.max_value > stats.min_value
+            ):
+                lo = max(stats.min_value, where.lower)
+                hi = min(stats.max_value, where.upper)
+                if hi < lo:
+                    return 0.0
+                return non_null * ((hi - lo) / (stats.max_value - stats.min_value))
+            return non_null / 3.0
         if where.op == CompareOp.EQ:
             if where.value is None:
                 return float(stats.null_count)
@@ -166,7 +196,6 @@ class CostModel:
             return max(0.0, non_null - eq)
         if where.value is None:
             return 0.0
-        # INTEGER range interpolation; TEXT uses a conservative one-third guess.
         if isinstance(where.value, int) and isinstance(stats.min_value, int) and isinstance(stats.max_value, int):
             lo, hi, value = stats.min_value, stats.max_value, where.value
             if hi <= lo:
@@ -206,7 +235,7 @@ class CostModel:
         outer_col: int,
         inner_col: int,
     ) -> tuple[int, AccessPath, IndexSchema | None, PlanAlternative]:
-        del outer_col  # reserved for richer correlation/histogram models
+        del outer_col
         outer_rows = float(outer.stats.row_count if outer.stats is not None else 1000)
         inner_rows = float(inner.stats.row_count if inner.stats is not None else 1000)
         path, index = self._join_inner_path(inner, inner_col)
@@ -250,24 +279,21 @@ class CostModel:
         return AccessPath.TABLE_SCAN, None
 
     @staticmethod
-    def _legacy_access(
-        schema: TableSchema, where: ComparisonPredicate | None
-    ) -> tuple[AccessPath, IndexSchema | None]:
-        if where is None or where.op != CompareOp.EQ:
-            return AccessPath.TABLE_SCAN, None
-        if where.column.lower() == schema.primary_key.name.lower():
-            return AccessPath.PRIMARY_KEY, None
-        index = schema.index_on_column(where.column)
-        if index is not None:
-            return AccessPath.SECONDARY_INDEX, index
-        return AccessPath.TABLE_SCAN, None
+    def _legacy_access(schema: TableSchema, where):
+        path, index, _probe = choose_rule_access(schema, where)
+        return path, index
 
     @staticmethod
-    def _fallback_rows(schema: TableSchema, where: ComparisonPredicate | None) -> float:
+    def _fallback_rows(schema: TableSchema, where: Predicate | None) -> float:
         if where is None:
             return 1000.0
-        if where.op == CompareOp.EQ and where.column.lower() == schema.primary_key.name.lower():
-            return 1.0
+        for term in predicate_terms(where):
+            if (
+                isinstance(term, ComparisonPredicate)
+                and term.op == CompareOp.EQ
+                and term.column.lower() == schema.primary_key.name.lower()
+            ):
+                return 1.0
         return 100.0
 
     @staticmethod

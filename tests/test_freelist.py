@@ -165,8 +165,6 @@ def test_hot_journal_recovers_crash_during_tail_truncation(tmp_path: Path) -> No
     assert reclaimed > 0
     target = db.pager._pending_truncate_page_count
     assert target is not None and target < original_count
-    # Simulate the commit window after durable journal + DB metadata writes and
-    # after physical truncate, but before journal deletion.
     db.pager._sync_journal_if_needed()
     db.pager.flush_all(sync=True)
     db.pager._file.truncate(target * db.pager.page_size)
@@ -199,10 +197,10 @@ def test_v1_metadata_opens_and_upgrades_when_freelist_semantics_are_persisted(tm
         db.flush()
 
     with Database(path) as db:
-        assert db.meta.version == 2  # upgraded in-memory on open
-        db.reindex("idx_v")  # first persisted free-list mutation writes format v2
+        assert db.meta.version == 3
+        db.reindex("idx_v")
         assert db.pager.free_list_pages()
         with db.pager.pin_page(0) as raw:
             persisted = DatabaseMeta.decode(raw)
-        assert persisted.version == 2
+        assert persisted.version == 3
         assert persisted.free_list_head == db.pager.free_list_head

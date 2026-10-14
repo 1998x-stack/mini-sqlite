@@ -40,7 +40,8 @@ class Database(CoreDatabase):
         LockRegistry.bind_liveness(
             self.path,
             self.connection_id,
-            lambda: self._registered and (self._maintenance_in_progress or not self.pager._file.closed),
+            lambda: self._registered
+            and (self._maintenance_in_progress or not self.pager._file.closed),
         )
 
     def lock_status(self) -> str:
@@ -92,6 +93,7 @@ class Database(CoreDatabase):
         stmt = Parser(sql).parse()
         if not isinstance(stmt, SelectStmtAst):
             raise SchemaError("EXPLAIN ANALYZE currently accepts SELECT statements only")
+
         acquired = False
         if not self.in_transaction:
             self._acquire_shared_snapshot()
@@ -112,7 +114,8 @@ class Database(CoreDatabase):
                 buffer_hits=int(after["hits"]) - int(before["hits"]),
                 buffer_misses=int(after["misses"]) - int(before["misses"]),
                 buffer_evictions=int(after["evictions"]) - int(before["evictions"]),
-                buffer_dirty_evictions=int(after["dirty_evictions"]) - int(before["dirty_evictions"]),
+                buffer_dirty_evictions=int(after["dirty_evictions"])
+                - int(before["dirty_evictions"]),
             )
         finally:
             if acquired:
@@ -122,6 +125,7 @@ class Database(CoreDatabase):
     def pages_text(self) -> str:
         from mini_sqlite.btree.node import BTreeNode
         from mini_sqlite.index.node import IndexNode
+
         free_pages = set(self.pager.free_list_pages())
         lines = ["PAGE  TYPE          CELLS  PARENT  RIGHT"]
         lines.append(f"{0:>4}  {'META':<13} {'-':>5}  {'-':>6}  {'-':>5}")
@@ -141,29 +145,43 @@ class Database(CoreDatabase):
                 except Exception:
                     lines.append(f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}")
                     continue
-            lines.append(f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  {node.parent:>6}  {node.right_sibling:>5}")
+            lines.append(
+                f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  "
+                f"{node.parent:>6}  {node.right_sibling:>5}"
+            )
         return "\n".join(lines)
 
     def freelist_text(self) -> str:
         pages = self.pager.free_list_pages()
         if not pages:
             return "free_pages=0 head=0"
-        return f"free_pages={len(pages)} head={self.pager.free_list_head} chain={' -> '.join(str(page) for page in pages)}"
+        return (
+            f"free_pages={len(pages)} head={self.pager.free_list_head} "
+            f"chain={' -> '.join(str(page) for page in pages)}"
+        )
 
     def incremental_vacuum(self, max_pages: int | None = None) -> VacuumResult:
         if self.in_transaction:
             raise TransactionError("incremental VACUUM cannot run inside a transaction")
         if max_pages is not None and max_pages < 0:
             raise ValueError("max_pages must be >= 0 or None")
+
         try:
             if self.pager.journal_mode == "rollback":
-                LockRegistry.acquire_reserved(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
-                LockRegistry.acquire_exclusive(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+                LockRegistry.acquire_reserved(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+                LockRegistry.acquire_exclusive(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
             else:
-                LockRegistry.acquire_checkpoint(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+                LockRegistry.acquire_checkpoint(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
         except BaseException:
             LockRegistry.release_all(self.path, self.connection_id)
             raise
+
         try:
             self._refresh_view()
             if self.pager.journal_mode == "wal":
@@ -182,7 +200,8 @@ class Database(CoreDatabase):
             if self.pager.journal_mode == "wal":
                 self.pager.checkpoint()
                 self._refresh_view()
-            return VacuumResult(before_pages=before_pages, after_pages=self.pager.page_count)
+            after_pages = self.pager.page_count
+            return VacuumResult(before_pages=before_pages, after_pages=after_pages)
         finally:
             LockRegistry.release_all(self.path, self.connection_id)
             self._snapshot_wal_signature = None
@@ -193,15 +212,23 @@ class Database(CoreDatabase):
         state = LockRegistry.snapshot(self.path, self.connection_id)
         if state["connections"] != 1:
             raise BusyError("VACUUM requires the only live connection to the database")
+
         try:
             if self.pager.journal_mode == "rollback":
-                LockRegistry.acquire_reserved(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
-                LockRegistry.acquire_exclusive(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+                LockRegistry.acquire_reserved(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
+                LockRegistry.acquire_exclusive(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
             else:
-                LockRegistry.acquire_checkpoint(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+                LockRegistry.acquire_checkpoint(
+                    self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+                )
         except BaseException:
             LockRegistry.release_all(self.path, self.connection_id)
             raise
+
         self._maintenance_in_progress = True
         temp_path = self.path.with_name(f".{self.path.name}.vacuum-{self.connection_id}.tmp")
         temp_journal = temp_path.with_name(temp_path.name + "-journal")
@@ -212,34 +239,62 @@ class Database(CoreDatabase):
             if self.pager.journal_mode == "wal":
                 self.pager.checkpoint()
                 self._refresh_view()
+
             before_pages = self.pager.page_count
             tables = self.catalog.list_tables()
             table_payloads: list[tuple[object, list[tuple[int, bytes]]]] = []
             for table in tables:
                 tree = BTree(self.pager, table.root_page)
                 table_payloads.append((table, list(tree.scan())))
+
             for path in (temp_path, temp_journal, temp_wal, *temp_lock_paths):
                 if path.exists():
                     path.unlink()
-            with type(self)(temp_path, journal_mode="rollback", buffer_pages=int(self.pager.buffer_stats()["capacity"]), replacement_policy=str(self.pager.buffer_stats()["policy"]), busy_timeout_ms=0) as compact:
+
+            with type(self)(
+                temp_path,
+                journal_mode="rollback",
+                buffer_pages=int(self.pager.buffer_stats()["capacity"]),
+                replacement_policy=str(self.pager.buffer_stats()["policy"]),
+                busy_timeout_ms=0,
+            ) as compact:
                 for source_table, rows in table_payloads:
-                    new_schema = compact.catalog.create_table(source_table.name, list(source_table.columns))
-                    new_tree = BTree(compact.pager, new_schema.root_page, on_root_change=lambda root, table_id=new_schema.table_id: compact.catalog.update_root_page(table_id, root))
+                    new_schema = compact.catalog.create_table(
+                        source_table.name, list(source_table.columns)
+                    )
+                    new_tree = BTree(
+                        compact.pager,
+                        new_schema.root_page,
+                        on_root_change=lambda root, table_id=new_schema.table_id: compact.catalog.update_root_page(
+                            table_id, root
+                        ),
+                    )
                     for rowid, raw in rows:
                         new_tree.insert(rowid, raw)
                     for index in source_table.indexes:
-                        compact.catalog.create_index(index.name, source_table.name, index.column)
+                        compact.catalog.create_index(index.name, source_table.name, index.columns)
                     if source_table.stats is not None:
                         compact.catalog.analyze(source_table.name)
                 compact.flush()
+
             buffer_stats = self.pager.buffer_stats()
             journal_mode = self.pager.journal_mode
             self.pager.close()
             os.replace(temp_path, self.path)
-            for sidecar in (self.path.with_name(self.path.name + "-journal"), self.path.with_name(self.path.name + "-wal")):
+            for sidecar in (
+                self.path.with_name(self.path.name + "-journal"),
+                self.path.with_name(self.path.name + "-wal"),
+            ):
                 if sidecar.exists():
                     sidecar.unlink()
-            self.pager = Pager(self.path, journal_mode=journal_mode, buffer_pages=int(buffer_stats["capacity"]), replacement_policy=str(buffer_stats["policy"]), recover=False)
+
+            self.pager = Pager(
+                self.path,
+                journal_mode=journal_mode,
+                buffer_pages=int(buffer_stats["capacity"]),
+                replacement_policy=str(buffer_stats["policy"]),
+                recover=False,
+            )
             self.meta = self._open_or_initialize()
             self.tx = TransactionManager(self.pager)
             self._install_runtime()

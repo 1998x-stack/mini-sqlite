@@ -4,8 +4,8 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 
-from mini_sqlite.errors import SchemaError
 from mini_sqlite.catalog.statistics import TableStats
+from mini_sqlite.errors import SchemaError
 
 
 class ColumnType(str, Enum):
@@ -23,9 +23,14 @@ class Column:
 @dataclass
 class IndexSchema:
     name: str
-    column: str
+    columns: tuple[str, ...]
     root_page: int
     unique: bool = False
+
+    @property
+    def column(self) -> str:
+        """Historical single-column compatibility view (the leftmost key)."""
+        return self.columns[0]
 
 
 @dataclass
@@ -58,9 +63,30 @@ class TableSchema:
         return self.columns[self.column_index(name)]
 
     def index_on_column(self, column: str) -> IndexSchema | None:
+        """Return an index whose leftmost key is *column*.
+
+        Existing JOIN code relies on this leftmost-prefix rule. v1.3 may keep
+        multiple indexes with the same first column; the first catalog order is
+        deterministic and the cost planner can inspect richer candidates later.
+        """
         lowered = column.lower()
         for index in self.indexes:
-            if index.column.lower() == lowered:
+            if index.columns and index.columns[0].lower() == lowered:
+                return index
+        return None
+
+    def indexes_starting_with(self, column: str) -> list[IndexSchema]:
+        lowered = column.lower()
+        return [
+            index
+            for index in self.indexes
+            if index.columns and index.columns[0].lower() == lowered
+        ]
+
+    def index_on_columns(self, columns: tuple[str, ...] | list[str]) -> IndexSchema | None:
+        wanted = tuple(name.lower() for name in columns)
+        for index in self.indexes:
+            if tuple(name.lower() for name in index.columns) == wanted:
                 return index
         return None
 
@@ -117,7 +143,11 @@ class TableSchema:
             "indexes": [
                 {
                     "name": index.name,
+                    # `column` is retained as a readable historical hint; v1.3
+                    # engines use `columns` and format-version 3 prevents old
+                    # writers from silently treating a composite index as scalar.
                     "column": index.column,
+                    "columns": list(index.columns),
                     "root_page": index.root_page,
                     "unique": index.unique,
                 }
@@ -130,6 +160,19 @@ class TableSchema:
     @classmethod
     def decode(cls, raw: bytes) -> "TableSchema":
         obj = json.loads(raw.decode("utf-8"))
+        indexes: list[IndexSchema] = []
+        for item in obj.get("indexes", []):
+            raw_columns = item.get("columns")
+            if raw_columns is None:
+                raw_columns = [item["column"]]
+            indexes.append(
+                IndexSchema(
+                    name=str(item["name"]),
+                    columns=tuple(str(value) for value in raw_columns),
+                    root_page=int(item["root_page"]),
+                    unique=bool(item.get("unique", False)),
+                )
+            )
         return cls(
             table_id=int(obj["table_id"]),
             name=str(obj["name"]),
@@ -142,16 +185,6 @@ class TableSchema:
                 )
                 for c in obj["columns"]
             ],
-            # Missing `indexes` is intentionally accepted so a v0.3 engine can
-            # read databases produced by v0.1/v0.2.
-            indexes=[
-                IndexSchema(
-                    name=str(i["name"]),
-                    column=str(i["column"]),
-                    root_page=int(i["root_page"]),
-                    unique=bool(i.get("unique", False)),
-                )
-                for i in obj.get("indexes", [])
-            ],
+            indexes=indexes,
             stats=TableStats.decode(obj.get("stats")),
         )

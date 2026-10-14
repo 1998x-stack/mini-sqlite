@@ -12,6 +12,8 @@ from mini_sqlite.storage.meta import DatabaseMeta
 
 @dataclass(frozen=True)
 class IntegrityReport:
+    """Result of a logical + structural database consistency pass."""
+
     ok: bool
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
@@ -27,18 +29,31 @@ class IntegrityReport:
     def render(self) -> str:
         lines = [
             "ok" if self.ok else "corrupt",
-            f"pages={self.page_count} reachable={self.reachable_pages} free={self.free_pages} orphan={len(self.orphan_pages)} tables={self.tables} rows={self.rows} indexes={self.indexes} index_entries={self.index_entries}",
+            (
+                f"pages={self.page_count} reachable={self.reachable_pages} "
+                f"free={self.free_pages} orphan={len(self.orphan_pages)} "
+                f"tables={self.tables} rows={self.rows} "
+                f"indexes={self.indexes} index_entries={self.index_entries}"
+            ),
         ]
         if self.errors:
             lines.append("errors:")
-            lines.extend(f"  - {m}" for m in self.errors)
+            lines.extend(f"  - {message}" for message in self.errors)
         if self.warnings:
             lines.append("warnings:")
-            lines.extend(f"  - {m}" for m in self.warnings)
+            lines.extend(f"  - {message}" for message in self.warnings)
         return "\n".join(lines)
 
 
 class IntegrityChecker:
+    """Validate page trees, rows, catalog references, and secondary indexes.
+
+    This is deliberately stronger than merely decoding every page. It checks that
+    parent/child relationships form trees, leaf sibling chains are coherent, table
+    rowids agree with INTEGER PRIMARY KEY values, and each persisted secondary
+    index is exactly the set implied by table rows.
+    """
+
     def __init__(self, pager, catalog, meta: DatabaseMeta):
         self.pager = pager
         self.catalog = catalog
@@ -55,9 +70,13 @@ class IntegrityChecker:
         if self.pager.page_count == 0:
             self.errors.append("database has no metadata page")
             return self._report(0, 0)
+
         if self.meta.catalog_root_page <= 0 or self.meta.catalog_root_page >= self.pager.page_count:
-            self.errors.append(f"catalog root page {self.meta.catalog_root_page} is outside logical page range")
+            self.errors.append(
+                f"catalog root page {self.meta.catalog_root_page} is outside logical page range"
+            )
             return self._report(0, 0)
+
         try:
             free_pages = self.pager.free_list_pages()
         except Exception as exc:
@@ -66,38 +85,74 @@ class IntegrityChecker:
         self.total_free_pages = len(free_pages)
         for page_id in free_pages:
             self._claim(page_id, "free-list")
+
         self._walk_integer_tree(self.meta.catalog_root_page, "catalog")
         try:
             tables = self.catalog.list_tables()
         except Exception as exc:
             self.errors.append(f"catalog rows cannot be decoded: {exc}")
             return self._report(0, 0)
+
         table_rows: dict[int, list[tuple[int, tuple[object, ...]]]] = {}
         for table in tables:
             rows = self._check_table(table)
             table_rows[table.table_id] = rows
             self.total_rows += len(rows)
+
         for table in tables:
             for index in table.indexes:
                 self.total_indexes += 1
-                self.total_index_entries += self._check_index(table, index, table_rows.get(table.table_id, []))
+                self.total_index_entries += self._check_index(
+                    table, index, table_rows.get(table.table_id, [])
+                )
+
         for table in tables:
             if table.stats is not None:
                 actual = len(table_rows.get(table.table_id, []))
                 if table.stats.row_count != actual:
-                    self.warnings.append(f"statistics for {table.name} are stale: row_count={table.stats.row_count}, actual={actual}; run ANALYZE")
+                    self.warnings.append(
+                        f"statistics for {table.name} are stale: "
+                        f"row_count={table.stats.row_count}, actual={actual}; run ANALYZE"
+                    )
+
         reachable = set(self.owners)
         orphan = tuple(sorted(set(range(self.pager.page_count)) - reachable))
         if orphan:
             sample = ", ".join(str(page) for page in orphan[:12])
             suffix = "…" if len(orphan) > 12 else ""
-            self.warnings.append(f"{len(orphan)} unreachable page(s) can be reclaimed by VACUUM: {sample}{suffix}")
-        return IntegrityReport(not self.errors, tuple(self.errors), tuple(self.warnings), self.pager.page_count, len(reachable), self.total_free_pages, orphan, len(tables), self.total_rows, self.total_indexes, self.total_index_entries)
+            self.warnings.append(
+                f"{len(orphan)} unreachable page(s) can be reclaimed by VACUUM: {sample}{suffix}"
+            )
+        return IntegrityReport(
+            ok=not self.errors,
+            errors=tuple(self.errors),
+            warnings=tuple(self.warnings),
+            page_count=self.pager.page_count,
+            reachable_pages=len(reachable),
+            free_pages=self.total_free_pages,
+            orphan_pages=orphan,
+            tables=len(tables),
+            rows=self.total_rows,
+            indexes=self.total_indexes,
+            index_entries=self.total_index_entries,
+        )
 
     def _report(self, tables: int, rows: int) -> IntegrityReport:
         reachable = set(self.owners)
         orphan = tuple(sorted(set(range(self.pager.page_count)) - reachable))
-        return IntegrityReport(not self.errors, tuple(self.errors), tuple(self.warnings), self.pager.page_count, len(reachable), self.total_free_pages, orphan, tables, rows, self.total_indexes, self.total_index_entries)
+        return IntegrityReport(
+            ok=not self.errors,
+            errors=tuple(self.errors),
+            warnings=tuple(self.warnings),
+            page_count=self.pager.page_count,
+            reachable_pages=len(reachable),
+            free_pages=self.total_free_pages,
+            orphan_pages=orphan,
+            tables=tables,
+            rows=rows,
+            indexes=self.total_indexes,
+            index_entries=self.total_index_entries,
+        )
 
     def _claim(self, page_id: int, owner: str) -> bool:
         if page_id <= 0 or page_id >= self.pager.page_count:
@@ -117,6 +172,7 @@ class IntegrityChecker:
     def _walk_integer_tree(self, root_page: int, owner: str) -> list[BTreeNode]:
         leaves: list[BTreeNode] = []
         visiting: set[int] = set()
+
         def visit(page_id: int, expected_parent: int, low: int | None, high: int | None) -> None:
             if page_id in visiting:
                 self.errors.append(f"{owner} contains a page cycle at {page_id}")
@@ -131,9 +187,12 @@ class IntegrityChecker:
                 visiting.remove(page_id)
                 return
             if node.parent != expected_parent:
-                self.errors.append(f"{owner} page {page_id} parent={node.parent}, expected={expected_parent}")
+                self.errors.append(
+                    f"{owner} page {page_id} parent={node.parent}, expected={expected_parent}"
+                )
+
             if node.is_leaf:
-                keys = [c.key for c in node.leaf_cells]
+                keys = [cell.key for cell in node.leaf_cells]
                 if keys != sorted(keys) or len(keys) != len(set(keys)):
                     self.errors.append(f"{owner} leaf page {page_id} keys are not strictly ordered")
                 for key in keys:
@@ -143,25 +202,33 @@ class IntegrityChecker:
                         self.errors.append(f"{owner} key {key} on page {page_id} is not below {high}")
                 leaves.append(node)
             else:
-                seps = [c.key for c in node.internal_cells]
+                seps = [cell.key for cell in node.internal_cells]
                 if seps != sorted(seps) or len(seps) != len(set(seps)):
-                    self.errors.append(f"{owner} internal page {page_id} separators are not strictly ordered")
+                    self.errors.append(
+                        f"{owner} internal page {page_id} separators are not strictly ordered"
+                    )
                 children = node.children()
                 if not children or any(child == 0 for child in children):
                     self.errors.append(f"{owner} internal page {page_id} has a zero/missing child")
                 for i, child in enumerate(children):
-                    visit(child, page_id, low if i == 0 else seps[i-1], high if i == len(children)-1 else seps[i])
+                    child_low = low if i == 0 else seps[i - 1]
+                    child_high = high if i == len(children) - 1 else seps[i]
+                    visit(child, page_id, child_low, child_high)
             visiting.remove(page_id)
+
         visit(root_page, 0, None, None)
         for i, leaf in enumerate(leaves):
-            expected = leaves[i+1].page_id if i+1 < len(leaves) else 0
+            expected = leaves[i + 1].page_id if i + 1 < len(leaves) else 0
             if leaf.right_sibling != expected:
-                self.errors.append(f"{owner} leaf page {leaf.page_id} right={leaf.right_sibling}, expected={expected}")
+                self.errors.append(
+                    f"{owner} leaf page {leaf.page_id} right={leaf.right_sibling}, expected={expected}"
+                )
         return leaves
 
     def _walk_index_tree(self, root_page: int, owner: str) -> list[IndexNode]:
         leaves: list[IndexNode] = []
         visiting: set[int] = set()
+
         def visit(page_id: int, expected_parent: int, low: bytes | None, high: bytes | None) -> None:
             if page_id in visiting:
                 self.errors.append(f"{owner} contains a page cycle at {page_id}")
@@ -176,9 +243,12 @@ class IntegrityChecker:
                 visiting.remove(page_id)
                 return
             if node.parent != expected_parent:
-                self.errors.append(f"{owner} page {page_id} parent={node.parent}, expected={expected_parent}")
+                self.errors.append(
+                    f"{owner} page {page_id} parent={node.parent}, expected={expected_parent}"
+                )
+
             if node.is_leaf:
-                keys = [c.key for c in node.leaf_cells]
+                keys = [cell.key for cell in node.leaf_cells]
                 if keys != sorted(keys) or len(keys) != len(set(keys)):
                     self.errors.append(f"{owner} leaf page {page_id} keys are not strictly ordered")
                 for key in keys:
@@ -188,20 +258,27 @@ class IntegrityChecker:
                         self.errors.append(f"{owner} key on page {page_id} exceeds upper bound")
                 leaves.append(node)
             else:
-                seps = [c.key for c in node.internal_cells]
+                seps = [cell.key for cell in node.internal_cells]
                 if seps != sorted(seps) or len(seps) != len(set(seps)):
-                    self.errors.append(f"{owner} internal page {page_id} separators are not strictly ordered")
+                    self.errors.append(
+                        f"{owner} internal page {page_id} separators are not strictly ordered"
+                    )
                 children = node.children()
                 if not children or any(child == 0 for child in children):
                     self.errors.append(f"{owner} internal page {page_id} has a zero/missing child")
                 for i, child in enumerate(children):
-                    visit(child, page_id, low if i == 0 else seps[i-1], high if i == len(children)-1 else seps[i])
+                    child_low = low if i == 0 else seps[i - 1]
+                    child_high = high if i == len(children) - 1 else seps[i]
+                    visit(child, page_id, child_low, child_high)
             visiting.remove(page_id)
+
         visit(root_page, 0, None, None)
         for i, leaf in enumerate(leaves):
-            expected = leaves[i+1].page_id if i+1 < len(leaves) else 0
+            expected = leaves[i + 1].page_id if i + 1 < len(leaves) else 0
             if leaf.right_sibling != expected:
-                self.errors.append(f"{owner} leaf page {leaf.page_id} right={leaf.right_sibling}, expected={expected}")
+                self.errors.append(
+                    f"{owner} leaf page {leaf.page_id} right={leaf.right_sibling}, expected={expected}"
+                )
         return leaves
 
     def _check_table(self, table: TableSchema) -> list[tuple[int, tuple[object, ...]]]:
@@ -215,13 +292,18 @@ class IntegrityChecker:
                     row = RecordCodec.decode(cell.value)
                     table.validate_row(row)
                 except Exception as exc:
-                    self.errors.append(f"{owner} rowid {cell.key} cannot be decoded/validated: {exc}")
+                    self.errors.append(
+                        f"{owner} rowid {cell.key} cannot be decoded/validated: {exc}"
+                    )
                     continue
                 if cell.key in seen:
                     self.errors.append(f"{owner} contains duplicate rowid {cell.key}")
                 seen.add(cell.key)
                 if row[table.primary_key_index] != cell.key:
-                    self.errors.append(f"{owner} rowid {cell.key} disagrees with primary key {row[table.primary_key_index]!r}")
+                    self.errors.append(
+                        f"{owner} rowid {cell.key} disagrees with primary key "
+                        f"{row[table.primary_key_index]!r}"
+                    )
                 rows.append((cell.key, row))
         return rows
 
@@ -231,11 +313,23 @@ class IntegrityChecker:
         actual: list[tuple[bytes, bytes]] = []
         for leaf in leaves:
             actual.extend((cell.key, cell.value) for cell in leaf.leaf_cells)
-        column_index = table.column_index(index.column)
-        column_type = table.columns[column_index].type
-        expected = sorted((KeyCodec.composite_key(values[column_index], column_type, rowid), KeyCodec.encode_rowid(rowid)) for rowid, values in rows)
+
+        column_indexes = tuple(table.column_index(name) for name in index.columns)
+        column_types = tuple(table.columns[i].type for i in column_indexes)
+        expected = sorted(
+            (
+                KeyCodec.index_key(
+                    tuple(values[i] for i in column_indexes), column_types, rowid
+                ),
+                KeyCodec.encode_rowid(rowid),
+            )
+            for rowid, values in rows
+        )
         if actual != expected:
-            self.errors.append(f"{owner} contents disagree with {table.name}.{index.column}: expected {len(expected)} entries, found {len(actual)}")
+            self.errors.append(
+                f"{owner} contents disagree with {table.name}({', '.join(index.columns)}): "
+                f"expected {len(expected)} entries, found {len(actual)}"
+            )
         for key, stored in actual:
             try:
                 rowid_from_key = KeyCodec.decode_rowid(key)
@@ -244,5 +338,7 @@ class IntegrityChecker:
                 self.errors.append(f"{owner} contains invalid rowid encoding: {exc}")
                 continue
             if rowid_from_key != rowid_from_value:
-                self.errors.append(f"{owner} key rowid {rowid_from_key} != stored rowid {rowid_from_value}")
+                self.errors.append(
+                    f"{owner} key rowid {rowid_from_key} != stored rowid {rowid_from_value}"
+                )
         return len(actual)

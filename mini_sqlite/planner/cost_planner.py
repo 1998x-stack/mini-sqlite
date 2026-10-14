@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from mini_sqlite.errors import SchemaError
+from mini_sqlite.planner.indexing import render_predicate
 from mini_sqlite.planner.optimizer import CostModel
 from mini_sqlite.planner.plan import (
     AccessPath,
@@ -54,11 +56,14 @@ class CostBasedPlanner(LegacyPlanner):
                     alternatives=choice.alternatives,
                 )
             assert isinstance(plan, SelectPlan)
-            choice = self.cost_model.choose_access(plan.schema, plan.where)
+            choice = self.cost_model.choose_access(
+                plan.schema, plan.where, plan.access_path, plan.index
+            )
             return replace(
                 plan,
                 access_path=choice.path,
                 index=choice.index,
+                index_probe=plan.index_probe if choice.path != AccessPath.TABLE_SCAN else None,
                 estimated_rows=choice.estimated_rows,
                 estimated_cost=choice.estimated_cost if choice.alternatives else None,
                 alternatives=choice.alternatives,
@@ -66,8 +71,15 @@ class CostBasedPlanner(LegacyPlanner):
 
         if isinstance(stmt, (DeleteStmt, UpdateStmt)):
             assert isinstance(plan, (DeletePlan, UpdatePlan))
-            choice = self.cost_model.choose_access(plan.schema, plan.where)
-            return replace(plan, access_path=choice.path, index=choice.index)
+            choice = self.cost_model.choose_access(
+                plan.schema, plan.where, plan.access_path, plan.index
+            )
+            return replace(
+                plan,
+                access_path=choice.path,
+                index=choice.index,
+                index_probe=plan.index_probe if choice.path != AccessPath.TABLE_SCAN else None,
+            )
         return plan
 
     @staticmethod
@@ -119,8 +131,8 @@ class CostBasedPlanner(LegacyPlanner):
         if isinstance(plan, SelectPlan):
             parts = [f"SELECT FROM {plan.schema.name} USING {LegacyPlanner._path_text(plan)}"]
             CostBasedPlanner._append_estimates(parts, plan)
-            if plan.where is not None and plan.access_path == AccessPath.TABLE_SCAN:
-                parts.append(f"FILTER {plan.where.column} {plan.where.op.value} {plan.where.value!r}")
+            if plan.where is not None:
+                parts.append(f"FILTER {render_predicate(plan.where)}")
             if plan.order_by is not None:
                 parts.append(
                     f"SORT {plan.order_by.column_name} "

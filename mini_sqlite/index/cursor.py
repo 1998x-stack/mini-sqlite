@@ -4,22 +4,36 @@ from mini_sqlite.index.secondary import SecondaryIndex
 
 
 class SecondaryIndexCursor:
-    """Equality-lookup cursor over a snapshot of matching rowids.
-
-    The index tree performs logarithmic navigation to the first matching key;
-    materializing only the duplicate rowid run keeps v0.3 execution simple while
-    making later page-pin cursors a clean replacement in v0.7.
-    """
+    """Materialized rowid cursor for equality/prefix/range index scans."""
 
     def __init__(self, index: SecondaryIndex):
         self.index = index
         self._rowids: list[int] = []
         self._position = -1
 
-    def seek_equal(self, value: object) -> bool:
-        self._rowids = self.index.lookup(value)
+    def _reset(self, rowids: list[int]) -> bool:
+        self._rowids = rowids
         self._position = 0
         return bool(self._rowids)
+
+    def seek_equal(self, value: object) -> bool:
+        return self._reset(self.index.lookup(value))
+
+    def seek_prefix(self, values: tuple[object, ...]) -> bool:
+        return self._reset(self.index.lookup_prefix(values))
+
+    def seek_range(self, probe) -> bool:
+        return self._reset(
+            self.index.lookup_range(
+                equality_values=probe.equality_values,
+                lower=probe.lower,
+                lower_inclusive=probe.lower_inclusive,
+                upper=probe.upper,
+                upper_inclusive=probe.upper_inclusive,
+                has_lower=probe.has_lower,
+                has_upper=probe.has_upper,
+            )
+        )
 
     @property
     def current_rowid(self) -> int | None:

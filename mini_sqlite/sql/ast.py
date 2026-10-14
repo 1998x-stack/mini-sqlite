@@ -25,10 +25,35 @@ class AggregateFunction(str, Enum):
 
 @dataclass(frozen=True)
 class ComparisonPredicate:
-    # v0.5 allows either unqualified names (age) or qualified names (u.age).
     column: str
     op: CompareOp
     value: Any
+
+
+@dataclass(frozen=True)
+class BetweenPredicate:
+    column: str
+    lower: Any
+    upper: Any
+
+
+PredicateAtom = ComparisonPredicate | BetweenPredicate
+
+
+@dataclass(frozen=True)
+class AndPredicate:
+    terms: tuple[PredicateAtom, ...]
+
+
+Predicate = PredicateAtom | AndPredicate
+
+
+def predicate_terms(predicate: Predicate | None) -> tuple[PredicateAtom, ...]:
+    if predicate is None:
+        return ()
+    if isinstance(predicate, AndPredicate):
+        return predicate.terms
+    return (predicate,)
 
 
 # Historical name kept as an import-compatible alias for v0.1-v0.3 readers.
@@ -38,7 +63,7 @@ EqualityPredicate = ComparisonPredicate
 @dataclass(frozen=True)
 class AggregateExpr:
     function: AggregateFunction
-    column: str | None = None  # None means COUNT(*)
+    column: str | None = None
 
     @property
     def display_name(self) -> str:
@@ -85,7 +110,12 @@ class CreateTableStmt:
 class CreateIndexStmt:
     name: str
     table: str
-    column: str
+    columns: tuple[str, ...]
+
+    @property
+    def column(self) -> str:
+        """Compatibility view for historical single-column callers."""
+        return self.columns[0]
 
 
 @dataclass(frozen=True)
@@ -98,7 +128,7 @@ class InsertStmt:
 class SelectStmt:
     table: str
     items: list[str | AggregateExpr]
-    where: ComparisonPredicate | None = None
+    where: Predicate | None = None
     order_by: OrderBy | None = None
     limit: int | None = None
     table_alias: str | None = None
@@ -106,7 +136,6 @@ class SelectStmt:
 
     @property
     def columns(self) -> list[str]:
-        """Compatibility view used by older teaching/tests for column-only SELECTs."""
         return [item for item in self.items if isinstance(item, str)]
 
     @property
@@ -117,14 +146,14 @@ class SelectStmt:
 @dataclass(frozen=True)
 class DeleteStmt:
     table: str
-    where: ComparisonPredicate | None = None
+    where: Predicate | None = None
 
 
 @dataclass(frozen=True)
 class UpdateStmt:
     table: str
     assignments: tuple[Assignment, ...]
-    where: ComparisonPredicate | None = None
+    where: Predicate | None = None
 
 
 @dataclass(frozen=True)

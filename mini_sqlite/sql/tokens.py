@@ -41,6 +41,8 @@ class TokenType(Enum):
     END = auto()
     ROLLBACK = auto()
     ANALYZE = auto()
+    AND = auto()
+    BETWEEN = auto()
     IDENT = auto()
     NUMBER = auto()
     STRING = auto()
@@ -96,6 +98,8 @@ KEYWORDS = {
     "END": TokenType.END,
     "ROLLBACK": TokenType.ROLLBACK,
     "ANALYZE": TokenType.ANALYZE,
+    "AND": TokenType.AND,
+    "BETWEEN": TokenType.BETWEEN,
 }
 
 

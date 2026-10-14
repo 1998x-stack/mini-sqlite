@@ -11,6 +11,7 @@ class OpCode(Enum):
     REWIND = auto()
     SEEK_PK = auto()
     SEEK_INDEX_EQ = auto()
+    SEEK_INDEX_RANGE = auto()
     INDEX_TO_TABLE = auto()
 
     # v0.5 join-source instructions.
@@ -27,6 +28,7 @@ class OpCode(Enum):
 
     # v0.4 relational pipeline instructions.
     FILTER_COMPARE = auto()
+    FILTER_PREDICATE = auto()
     COLLECT_ROW = auto()
     SORT_ROWS = auto()
     PROJECT_ROWS = auto()

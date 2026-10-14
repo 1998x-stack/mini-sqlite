@@ -123,6 +123,38 @@ class ByteKeyBTree:
                 return
             node = self._load(node.right_sibling)
 
+    def scan_range(
+        self, lower: bytes | None = None, upper: bytes | None = None
+    ) -> Iterator[tuple[bytes, bytes]]:
+        """Yield keys in the half-open interval ``[lower, upper)``.
+
+        ``None`` means unbounded. The method descends directly to the first leaf
+        that can contain *lower* and then follows the leaf sibling chain until
+        the exclusive upper bound is reached.
+        """
+        if lower is not None and upper is not None and lower >= upper:
+            return
+        if lower is None:
+            node = self._load(self.root_page)
+            while not node.is_leaf:
+                node = self._load(node.first_child)
+            first = False
+        else:
+            node = self._find_leaf(lower)
+            first = True
+        while True:
+            keys = [c.key for c in node.leaf_cells]
+            start = bisect_left(keys, lower) if first and lower is not None else 0
+            first = False
+            for cell in node.leaf_cells[start:]:
+                if upper is not None and cell.key >= upper:
+                    return
+                if lower is None or cell.key >= lower:
+                    yield cell.key, cell.value
+            if node.right_sibling == 0:
+                return
+            node = self._load(node.right_sibling)
+
     def _find_leaf(self, key: bytes) -> IndexNode:
         node = self._load(self.root_page)
         while not node.is_leaf:

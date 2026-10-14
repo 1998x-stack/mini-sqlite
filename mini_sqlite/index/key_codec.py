@@ -1,21 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from mini_sqlite.catalog.schema import ColumnType
 from mini_sqlite.errors import SchemaError
 
 
 class KeyCodec:
-    """Encode SQL scalar values into deterministic ordered byte prefixes.
-
-    Secondary-index leaf keys are:
-
-        encode_value(indexed_value) || encode_rowid(rowid)
-
-    Appending the rowid makes every physical key unique while all rows with the
-    same indexed value still share the same prefix. v0.3 only needs equality
-    lookup, but INTEGER/TEXT encodings are deterministic and lexicographically
-    ordered enough to support later range-scan experiments.
-    """
+    """Order-preserving scalar/tuple encoding for secondary-index keys."""
 
     NULL_TAG = b"\x00"
     INTEGER_TAG = b"\x10"
@@ -33,16 +25,47 @@ class KeyCodec:
         if column_type == ColumnType.TEXT:
             if not isinstance(value, str):
                 raise SchemaError("TEXT index lookup requires a string literal")
-            # Escape NUL and terminate with 00 00. This makes the scalar encoding
-            # self-delimiting, so TEXT 'a' is not a prefix match for TEXT 'ab'.
             raw = value.encode("utf-8")
             escaped = raw.replace(b"\x00", b"\x00\xff")
             return cls.TEXT_TAG + escaped + b"\x00\x00"
         raise SchemaError(f"unsupported indexed column type: {column_type}")
 
     @classmethod
+    def encode_values(
+        cls, values: Iterable[object], column_types: Iterable[ColumnType]
+    ) -> bytes:
+        values_tuple = tuple(values)
+        types_tuple = tuple(column_types)
+        if len(values_tuple) != len(types_tuple):
+            raise SchemaError("index tuple value/type arity mismatch")
+        return b"".join(
+            cls.encode_value(value, column_type)
+            for value, column_type in zip(values_tuple, types_tuple)
+        )
+
+    @classmethod
     def composite_key(cls, value: object, column_type: ColumnType, rowid: int) -> bytes:
+        """Historical single-column helper."""
         return cls.encode_value(value, column_type) + cls.encode_rowid(rowid)
+
+    @classmethod
+    def index_key(
+        cls,
+        values: Iterable[object],
+        column_types: Iterable[ColumnType],
+        rowid: int,
+    ) -> bytes:
+        return cls.encode_values(values, column_types) + cls.encode_rowid(rowid)
+
+    @staticmethod
+    def prefix_successor(prefix: bytes) -> bytes | None:
+        """Smallest byte string strictly above every key beginning with prefix."""
+        data = bytearray(prefix)
+        for i in range(len(data) - 1, -1, -1):
+            if data[i] != 0xFF:
+                data[i] += 1
+                return bytes(data[: i + 1])
+        return None
 
     @classmethod
     def encode_rowid(cls, rowid: int) -> bytes:

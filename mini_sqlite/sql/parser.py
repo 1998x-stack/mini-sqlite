@@ -9,6 +9,8 @@ from mini_sqlite.sql.ast import (
     Assignment,
     BeginStmt,
     CommitStmt,
+    AndPredicate,
+    BetweenPredicate,
     ComparisonPredicate,
     CompareOp,
     CreateIndexStmt,
@@ -128,9 +130,11 @@ class Parser:
         self._expect(TokenType.ON)
         table = self._ident()
         self._expect(TokenType.LPAREN)
-        column = self._ident()
+        columns = [self._ident()]
+        while self._match(TokenType.COMMA):
+            columns.append(self._ident())
         self._expect(TokenType.RPAREN)
-        return CreateIndexStmt(name, table, column)
+        return CreateIndexStmt(name, table, tuple(columns))
 
     def _create_table_after_create(self) -> CreateTableStmt:
         self._expect(TokenType.TABLE)
@@ -194,7 +198,6 @@ class Parser:
         if self._match(TokenType.AS):
             alias = self._ident()
         elif self.current.type == TokenType.IDENT:
-            # SQL permits FROM users u as shorthand for FROM users AS u.
             alias = self._ident()
         return TableRef(name, alias)
 
@@ -230,8 +233,6 @@ class Parser:
         )
 
     def _join_clause(self, after_join_keyword: bool = False) -> JoinClause:
-        # `after_join_keyword` exists only to make the two parse branches above
-        # self-documenting; both arrive here with JOIN already consumed.
         _ = after_join_keyword
         right = self._table_ref()
         self._expect(TokenType.ON)
@@ -262,10 +263,23 @@ class Parser:
         self._expect(TokenType.EQ)
         return Assignment(column, self._literal())
 
-    def _optional_where(self) -> ComparisonPredicate | None:
+    def _optional_where(self):
         if not self._match(TokenType.WHERE):
             return None
+        terms = [self._predicate_atom()]
+        while self._match(TokenType.AND):
+            terms.append(self._predicate_atom())
+        if len(terms) == 1:
+            return terms[0]
+        return AndPredicate(tuple(terms))
+
+    def _predicate_atom(self):
         column = self._column_ref()
+        if self._match(TokenType.BETWEEN):
+            lower = self._literal()
+            self._expect(TokenType.AND)
+            upper = self._literal()
+            return BetweenPredicate(column, lower, upper)
         operators = {
             TokenType.EQ: CompareOp.EQ,
             TokenType.NE: CompareOp.NE,
@@ -276,7 +290,7 @@ class Parser:
         }
         op = operators.get(self.current.type)
         if op is None:
-            raise self._error("expected comparison operator")
+            raise self._error("expected comparison operator or BETWEEN")
         self._advance()
         return ComparisonPredicate(column, op, self._literal())
 

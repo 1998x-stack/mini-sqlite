@@ -38,7 +38,7 @@ class DatabaseMeta:
         magic, version, page_size, catalog_root, next_table_id, free_list_head = _META.unpack_from(page, 0)
         if magic != DB_MAGIC:
             raise CorruptionError(f"bad database magic: {magic!r}")
-        if version not in {1, FORMAT_VERSION}:
+        if version not in {1, 2, FORMAT_VERSION}:
             raise CorruptionError(f"unsupported format version {version}")
         if page_size != len(page):
             raise CorruptionError(

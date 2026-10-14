@@ -14,7 +14,13 @@ from mini_sqlite.planner.plan import (
     JoinSpec,
     OrderSpec,
 )
-from mini_sqlite.sql.ast import AggregateFunction, CompareOp, ComparisonPredicate
+from mini_sqlite.sql.ast import (
+    AggregateFunction,
+    BetweenPredicate,
+    CompareOp,
+    ComparisonPredicate,
+    predicate_terms,
+)
 from mini_sqlite.storage import Pager, RecordCodec
 from mini_sqlite.vm.instruction import Instruction
 from mini_sqlite.vm.opcode import OpCode
@@ -43,18 +49,7 @@ class VMResult:
 
 
 class VirtualMachine:
-    """Tiny VDBE-inspired interpreter.
-
-    v0.5 keeps the materialized relational working set and adds explicit
-    two-source join instructions. Cursor instructions still
-    expose physical access paths, while explicit relational opcodes transform
-    rows in the SQL order visible in bytecode:
-
-        source(s) -> join -> filter -> sort -> aggregate/project -> limit -> emit
-
-    This is deliberately simpler than SQLite's production VDBE and future
-    iterator/vectorized engines, but it makes relational stages inspectable.
-    """
+    """Tiny VDBE-inspired interpreter."""
 
     def __init__(self, pager: Pager, catalog: Catalog):
         self.pager = pager
@@ -66,7 +61,7 @@ class VirtualMachine:
         index_cursors: dict[int, OpenIndexCursor] = {}
         rows: list[tuple[Any, ...]] = []
         working_rows: list[tuple[Any, ...]] = []
-        projected: tuple[Any, ...] | None = None  # legacy v0.1-v0.3 path
+        projected: tuple[Any, ...] | None = None
         rowcount = 0
 
         while pc < len(code):
@@ -80,7 +75,7 @@ class VirtualMachine:
 
             elif op == OpCode.CREATE_INDEX:
                 plan = ins.p4
-                self.catalog.create_index(plan.name, plan.table, plan.column)
+                self.catalog.create_index(plan.name, plan.table, plan.columns)
                 rowcount += 1
 
             elif op in (OpCode.OPEN_READ, OpCode.OPEN_WRITE):
@@ -126,6 +121,12 @@ class VirtualMachine:
             elif op == OpCode.SEEK_INDEX_EQ:
                 cur = index_cursors[ins.p1]
                 if not cur.cursor.seek_equal(ins.p4):
+                    pc = ins.p2
+                    continue
+
+            elif op == OpCode.SEEK_INDEX_RANGE:
+                cur = index_cursors[ins.p1]
+                if not cur.cursor.seek_range(ins.p4):
                     pc = ins.p2
                     continue
 
@@ -183,7 +184,7 @@ class VirtualMachine:
                     if self._compare(row[spec.column_index], spec.op, spec.value)
                 ]
 
-            elif op == OpCode.FILTER_EQ:  # historical bytecode support
+            elif op == OpCode.FILTER_EQ:
                 cur = cursors[ins.p1]
                 current = cur.cursor.current
                 if current is None:
@@ -206,6 +207,17 @@ class VirtualMachine:
                     pc = ins.p2
                     continue
 
+            elif op == OpCode.FILTER_PREDICATE:
+                cur = cursors[ins.p1]
+                current = cur.cursor.current
+                if current is None:
+                    pc = ins.p2
+                    continue
+                values = tuple(RecordCodec.decode(current.value))
+                if not self._matches_predicate(cur.schema, values, ins.p4):
+                    pc = ins.p2
+                    continue
+
             elif op == OpCode.COLLECT_ROW:
                 cur = cursors[ins.p1]
                 current = cur.cursor.current
@@ -215,8 +227,6 @@ class VirtualMachine:
 
             elif op == OpCode.SORT_ROWS:
                 spec: OrderSpec = ins.p4
-                # Educational NULL policy: NULL sorts before non-NULL in ASC and
-                # therefore after non-NULL in DESC. Values in one column share a type.
                 working_rows.sort(
                     key=lambda row, i=spec.column_index: (row[i] is not None, row[i]),
                     reverse=spec.descending,
@@ -237,7 +247,7 @@ class VirtualMachine:
                 rows.extend(working_rows)
                 working_rows = []
 
-            elif op == OpCode.PROJECT:  # historical bytecode support
+            elif op == OpCode.PROJECT:
                 cur = cursors[ins.p1]
                 current = cur.cursor.current
                 if current is None:
@@ -245,7 +255,7 @@ class VirtualMachine:
                 values = RecordCodec.decode(current.value)
                 projected = tuple(values[i] for i in ins.p4)
 
-            elif op == OpCode.RESULT_ROW:  # historical bytecode support
+            elif op == OpCode.RESULT_ROW:
                 if projected is None:
                     raise RuntimeError("RESULT_ROW without PROJECT")
                 rows.append(projected)
@@ -287,10 +297,6 @@ class VirtualMachine:
                     new_tuple = tuple(new_values)
                     cur.schema.validate_row(new_tuple)
                     rowid = current.key
-
-                    # Remove old secondary entries before replacing the table row.
-                    # The surrounding rollback-journal transaction makes the whole
-                    # table+all-index mutation atomic on failure/crash.
                     for index_schema in cur.schema.indexes:
                         deleted = self._secondary_index(cur.schema, index_schema).delete(
                             old_values, rowid
@@ -340,14 +346,26 @@ class VirtualMachine:
             raise RuntimeError(f"{operation} without current row")
         return tuple(RecordCodec.decode(current.value))
 
+    @classmethod
+    def _matches_predicate(cls, schema: TableSchema, values: tuple[Any, ...], predicate) -> bool:
+        for term in predicate_terms(predicate):
+            idx = schema.column_index(term.column)
+            left = values[idx]
+            if isinstance(term, BetweenPredicate):
+                if left is None or term.lower is None or term.upper is None:
+                    return False
+                if not (term.lower <= left <= term.upper):
+                    return False
+            elif not cls._compare(left, term.op, term.value):
+                return False
+        return True
+
     @staticmethod
     def _compare(left: object, op: CompareOp, right: object) -> bool:
         if op == CompareOp.EQ:
             return left == right
         if op == CompareOp.NE:
             return left != right
-        # The project intentionally does not model SQL three-valued logic yet.
-        # Ordered comparison involving NULL simply does not match.
         if left is None or right is None:
             return False
         if op == CompareOp.LT:

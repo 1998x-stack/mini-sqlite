@@ -216,6 +216,7 @@ class Database:
         vm_result = self.vm.execute(code)
         if autocommit_write:
             self.commit()
+
         columns: list[str] = []
         projection_names = getattr(plan, "projection_names", None)
         if projection_names is not None:
@@ -224,6 +225,7 @@ class Database:
 
     def execute(self, sql: str) -> QueryResult:
         stmt = Parser(sql).parse()
+
         if isinstance(stmt, BeginStmt):
             self.begin()
             return QueryResult([], [], 0)
@@ -235,6 +237,7 @@ class Database:
             return QueryResult([], [], 0)
 
         read_only = isinstance(stmt, SelectStmtAst)
+
         if read_only and not self.in_transaction:
             self._acquire_shared_snapshot()
             try:
@@ -300,27 +303,32 @@ class Database:
                 cols.append(f"{col.name} {col.type.value}{suffix}")
             chunks.append(f"CREATE TABLE {table.name} ({', '.join(cols)});")
             for index in table.indexes:
-                chunks.append(f"CREATE INDEX {index.name} ON {table.name}({index.column});")
+                chunks.append(
+                    f"CREATE INDEX {index.name} ON {table.name}({', '.join(index.columns)});"
+                )
         return "\n".join(chunks)
 
     def indexes_text(self) -> str:
         rows = [
-            f"{index.name}: table={table.name} column={index.column} root={index.root_page}"
+            f"{index.name}: table={table.name} columns=({', '.join(index.columns)}) root={index.root_page}"
             for table, index in self.catalog.list_indexes()
         ]
         return "\n".join(rows)
 
     def btree_dump(self, table_name: str) -> str:
         schema = self.catalog.get_table(table_name)
-        return BTree(self.pager, schema.root_page).dump()
+        tree = BTree(self.pager, schema.root_page)
+        return tree.dump()
 
     def index_dump(self, index_name: str) -> str:
         _table, schema = self.catalog.get_index(index_name)
-        return ByteKeyBTree(self.pager, schema.root_page).dump()
+        tree = ByteKeyBTree(self.pager, schema.root_page)
+        return tree.dump()
 
     def pages_text(self) -> str:
         from mini_sqlite.btree.node import BTreeNode
         from mini_sqlite.index.node import IndexNode
+
         lines = ["PAGE  TYPE          CELLS  PARENT  RIGHT"]
         lines.append(f"{0:>4}  {'META':<13} {'-':>5}  {'-':>6}  {'-':>5}")
         for page_id in range(1, self.pager.page_count):
@@ -334,9 +342,14 @@ class Database:
                     node = IndexNode.decode(page_id, raw_copy)
                     kind = f"IDX_{node.node_type.name}"
                 except Exception:
-                    lines.append(f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}")
+                    lines.append(
+                        f"{page_id:>4}  {'UNKNOWN':<13} {'?':>5}  {'?':>6}  {'?':>5}"
+                    )
                     continue
-            lines.append(f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  {node.parent:>6}  {node.right_sibling:>5}")
+            lines.append(
+                f"{page_id:>4}  {kind:<13} {node.cell_count:>5}  "
+                f"{node.parent:>6}  {node.right_sibling:>5}"
+            )
         return "\n".join(lines)
 
     def buffer_status(self) -> str:
@@ -391,7 +404,9 @@ class Database:
             return self.pager.checkpoint()
         if self.pager.journal_mode != "wal":
             return self.pager.checkpoint()
-        LockRegistry.acquire_checkpoint(self.path, self.connection_id, timeout_ms=self.busy_timeout_ms)
+        LockRegistry.acquire_checkpoint(
+            self.path, self.connection_id, timeout_ms=self.busy_timeout_ms
+        )
         try:
             self._refresh_view()
             return self.pager.checkpoint()
