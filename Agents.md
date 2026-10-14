@@ -1,144 +1,171 @@
-# Agents.md — mini-sqlite v1.3 Development Contract
+# Agents.md — mini-sqlite Development Contract
 
-> Frozen learning snapshot. Read this file before changing ordered-index encoding, range planning, composite-index metadata, VM access paths, compatibility rules, tests, or documentation.
+> **Mandatory for future work:** read this file before changing code, tests, documentation, branches, formats, durability, planning, concurrency, maintenance, or ordered-index semantics.
+>
+> `main` is the canonical integrated state. Historical version branches are frozen learning snapshots.
 
-## 1. Version mission
+## 1. Repository mission
 
-v1.3 adds one dominant mental model:
+mini-sqlite is a Python-first educational database engine for understanding SQLite-style mechanisms.
 
-> **A B+Tree is useful not only because it can find one key, but because its lexicographic order can represent SQL equality prefixes and bounded ranges.**
-
-The v1.2 page lifecycle, free-list, durability, locking, buffer-pool, optimizer and maintenance layers remain intact. v1.3 extends the secondary-index path from scalar equality probes to ordered multi-column probes.
-
-## 2. Mandatory reading order
-
-1. `Agents.md`
-2. `version.md`
-3. `docs/ORDERED_INDEXES.md`
-4. `mini_sqlite/index/key_codec.py`
-5. `mini_sqlite/index/btree.py`
-6. `mini_sqlite/index/secondary.py`
-7. `mini_sqlite/planner/indexing.py`
-8. `mini_sqlite/planner/planner.py`
-9. `mini_sqlite/planner/optimizer.py`
-10. `mini_sqlite/vm/compiler.py`
-11. `mini_sqlite/vm/vm.py`
-12. `tests/test_range_composite.py`
-13. `examples/range_indexes.py`
-
-## 3. Branch boundary
-
-This branch is the frozen **v1.3 ordered range scan + composite-index milestone**.
-
-Do not backport v1.4 savepoints, covering-index execution, ORDER BY elimination, additional join algorithms, or MVCC.
-
-## 4. Layering invariant
+Priorities:
 
 ```text
-SQL predicates / CREATE INDEX
-        ↓
-Parser / AST
-        ↓
-left-prefix probe analysis
-        ↓
-Cost-Based Planner
-        ↓
-SEEK_INDEX_EQ or SEEK_INDEX_RANGE
-        ↓
-SecondaryIndexCursor
-        ↓
-KeyCodec bounds + ByteKeyBTree ordered scan
-        ↓
-rowid lookup
-        ↓
-residual predicate filter
+architectural clarity
+      ↓
+correctness + explicit invariants
+      ↓
+readable reference implementation
+      ↓
+mechanism-focused tests
+      ↓
+observable end-to-end behavior
+      ↓
+performance / SQL breadth later
 ```
 
-SQL parsing must not construct physical page keys. Planner describes a logical index probe. `SecondaryIndex` and `KeyCodec` own translation into byte bounds. B+Tree owns ordered traversal only.
+It is not SQLite binary compatible and is not intended for production workloads.
 
-## 5. Composite-index invariants
-
-- physical index order follows the declared column order;
-- the rowid remains the final key component so duplicate SQL keys remain unique;
-- scalar components are self-delimiting and lexicographically order-preserving;
-- old single-column indexes remain readable and behave as one-element composite indexes;
-- INSERT / UPDATE / DELETE / REINDEX / VACUUM maintain every indexed column atomically through existing transactions;
-- integrity checking reconstructs the complete composite physical key, not only the leftmost column.
-
-## 6. Left-prefix invariant
-
-For index `(a, b, c)`, an ordered probe may consume:
+## 2. Integrated architecture through v1.3
 
 ```text
-zero or more equality columns
-        +
-at most one following range column
+SQL / Parser / AST
+        ↓
+Cost-Based Planner ← ANALYZE statistics
+        ↓
+Compiler / Tiny VM
+        ↓
+Relational operators / JOIN
+        ↓
+Ordered Table + Secondary-Index B+Trees
+        ↓
+Database connection / process-local + POSIX file locks
+        ↓
+Pager
+        ↓
+Bounded Buffer Manager (LRU / CLOCK)
+        ↓
+Rollback Journal OR WAL
+        ↓
+Database file
+
+Lifecycle / space management:
+ integrity_check · reindex · vacuum · explain_analyze
+ free-list · page reuse · incremental_vacuum
+
+Ordered index layer:
+ scalar/composite keys · left-prefix probes · range cursors
 ```
 
-Examples:
+Every subsystem must remain at its narrowest useful boundary. SQL parsing must not encode physical index keys; B+Trees must not know SQL predicates; replacement policy must not bypass durability; maintenance must use normal transaction/storage APIs.
+
+## 3. Version history
 
 ```text
-a = 1                              usable
-a = 1 AND b = 2                    usable
-a = 1 AND b BETWEEN 10 AND 20      usable
-a = 1 AND b = 2 AND c >= 5         usable
-b = 2                              not usable
-c >= 5                             not usable
+v0.1  Page/Pager/B+Tree + SQL/Planner/VM
+v0.2  Rollback Journal + Transactions + Crash Recovery
+v0.3  Secondary Index
+v0.4  Relational Execution + UPDATE
+v0.5  INNER JOIN + Indexed Nested Loop
+v0.6  WAL + Read Overlay + Checkpoint
+v0.7  Bounded Buffer Manager + LRU/CLOCK
+v0.8  ANALYZE + Cost-Based Optimizer
+v0.9  Process-local Concurrency + Locks/Snapshots
+v1.0  Integrity / REINDEX / VACUUM / EXPLAIN ANALYZE
+v1.1  Cross-process POSIX File Locking
+v1.2  Persistent Free-list + Page Reuse + Incremental VACUUM
+v1.3  Range Index Scan + Composite Index                    ✅ integrated
 ```
 
-Conditions not consumed by the probe remain residual predicates and must still be evaluated for correctness.
+## 4. Branch invariant
 
-## 7. Range-bound invariants
+```text
+validated main
+   ↓
+create vX.Y
+   ↓
+implement one dominant mental model
+   ↓
+tests + docs + example
+   ↓
+exact version branch-head CI green
+   ↓
+freeze version branch
+   ↓
+integrate the same validated engine tree into main
+   ↓
+restore canonical main Agents.md / version.md
+```
 
-`ByteKeyBTree.scan_range(lower, upper)` uses a half-open interval `[lower, upper)`.
+Never claim a version is frozen from local tests alone.
 
-- inclusive SQL upper bounds use `KeyCodec.prefix_successor(encoded_upper)`;
-- exclusive SQL lower bounds advance to the prefix successor;
-- prefix equality scans stop at the successor of the full equality prefix;
-- unbounded ordered ranges start at the indexed column's type tag, not raw `0x00`, so SQL ordered comparisons do not accidentally include NULL;
-- NULL does not satisfy `<`, `<=`, `>`, `>=`, or BETWEEN in this educational SQL model.
+## 5. Core invariants
 
-## 8. Planner / optimizer invariants
+- SQL frontend never accesses page bytes directly.
+- Planner performs no OS I/O.
+- VM talks to cursors/storage abstractions, not files.
+- B+Trees obtain and mutate pages only through Pager.
+- Pager owns durability ordering and free-page lifecycle.
+- Buffer Manager owns residency/replacement, not durability.
+- pinned frames are never evicted.
+- rollback before-images become durable before unsafe DB-page writeback.
+- uncommitted WAL dirty frames never leak into the main DB.
+- WAL reads use only complete committed prefixes.
+- process-local lock state is mirrored to kernel `flock` for cross-process correctness.
+- Catalog owns schema/index/statistics metadata; root page ids are mutable and persisted.
+- valid free pages are explicit owners, not orphans.
+- allocation prefers persistent free-list pages before growing the file.
+- incremental vacuum truncates only a consecutive free suffix; it does not move live pages.
+- composite physical keys follow declared index-column order and end with rowid.
+- ordered index planning follows the SQL left-prefix rule: equality prefix then at most one range column.
+- residual predicates must still be evaluated when a probe does not consume the complete WHERE clause.
+- ordered SQL comparisons do not match NULL.
+- integrity checking is read-only; REINDEX/VACUUM use ordinary engine transactions/storage APIs.
 
-- primary-key equality remains the strongest rule candidate;
-- historical scalar equality can retain `SECONDARY_INDEX` / `SEEK_INDEX_EQ` for readability;
-- composite-prefix and range probes use `SECONDARY_INDEX_RANGE` / `SEEK_INDEX_RANGE`;
-- without ANALYZE, rule selection may use the best valid ordered index candidate;
-- with ANALYZE, the cost model may reject a broad range and choose TABLE SCAN;
-- EXPLAIN must reveal the chosen index and ordered columns.
+## 6. Compatibility rule
 
-## 9. Format compatibility
+Any incompatible page, record, catalog, rollback-journal, WAL, index-key, free-page, or lock-sidecar semantic change requires an explicit format/version statement and reopen/corruption tests.
 
-v1.3 promotes the main database format version from **2 → 3** because catalog index metadata now has an ordered `columns[]` tuple.
+Current main-file format is **v3**. v3 keeps the same page-0 binary layout as v2 but gates composite-index catalog semantics. Table/index node bytes, row bytes, rollback-journal bytes, WAL bytes, free-page bytes and lock sidecars are unchanged from their earlier milestones.
 
-The page-0 byte structure is unchanged. Table B+Tree bytes, secondary-index node bytes, row encoding, free-page bytes, rollback-journal records, WAL records and lock sidecars are unchanged.
+## 7. Testing contract
 
-v1.3 reads v1/v2 databases. Before a composite index becomes reachable, page 0 is persisted as format v3. Older v1.2 engines must reject v3 rather than silently reinterpret `(a,b)` as index `(a)`.
-
-## 10. Testing contract
-
-Run:
+Full regression:
 
 ```bash
 python -m pytest -q
-python examples/range_indexes.py
+python examples/quickstart.py
+python examples/transactions.py
 python examples/indexes.py
+python examples/relational.py
+python examples/joins.py
+python examples/wal.py
+python examples/buffer_pool.py
 python examples/optimizer.py
+python examples/concurrency.py
+python examples/lifecycle.py
+python examples/cross_process.py
+python examples/freelist.py
+python examples/range_indexes.py
 python -m compileall -q mini_sqlite
 ```
 
-Changes to ordered-index behavior must include boundary tests, NULL behavior, left-prefix fallback, maintenance/reopen tests and broad-vs-selective optimizer tests.
+For new mechanisms include invariants, error/boundary cases, reopen/persistence, optimizer diagnostics, concurrency/crash cases where relevant, and one educational example.
 
-## 11. Definition of done
+## 8. Next version boundary
 
-A v1.3 change is complete only when:
+**v1.4 — Savepoints** is the next dominant mental model:
 
-1. range scans return exactly the SQL-visible interval;
-2. composite indexes obey left-prefix semantics;
-3. residual predicates preserve correctness;
-4. range/index choices remain explainable through bytecode and EXPLAIN;
-5. UPDATE/DELETE/REINDEX/VACUUM/integrity remain correct for composite indexes;
-6. format-v1/v2 files still open and composite-index persistence crosses to v3 deliberately;
-7. all v0.1–v1.2 regressions remain green;
-8. exact branch-head CI passes on supported Python versions;
-9. docs match the actual key encoding and compatibility boundary.
+```text
+BEGIN
+  work A
+  SAVEPOINT s1
+    work B
+  SAVEPOINT s2
+    work C
+  ROLLBACK TO s2
+  RELEASE s1
+COMMIT
+```
+
+v1.4 must focus on partial rollback markers inside one transaction, including page allocation/free-list restoration and rollback/WAL correctness. Do not mix Hash Join, covering indexes, ORDER BY elimination, or MVCC into the same milestone.

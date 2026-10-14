@@ -1,61 +1,69 @@
-# mini-sqlite v1.3.0 — Ordered Range Scans + Composite Indexes
+# Current integrated state — v1.3
 
-## Status
+`main` contains the validated **v1.3 Ordered Range Scans + Composite Indexes** engine tree.
 
-**Implemented / frozen candidate.**
-
-v1.3 makes secondary indexes truly ordered: the engine can seek a lower bound, stop at an upper bound, combine equality prefixes with a following range column, and maintain multi-column indexes transactionally.
-
-## Main mental model
+## Integrated capability spine
 
 ```text
-SQL predicates
-   ↓
-left-prefix analysis
-   ↓
-(a = ?) (b = ?) (c range ?..?)
-   ↓
-ordered byte lower/upper bounds
-   ↓
-ByteKeyBTree.scan_range()
-   ↓
-rowid lookup
-   ↓
-residual filter
+SQL / Parser / AST
+        ↓
+Cost-Based Planner ← ANALYZE statistics
+        ↓
+Compiler / Tiny VM
+        ↓
+Relational pipeline / JOIN
+        ↓
+Ordered table + secondary-index B+Trees
+        ↓
+Buffer / Pager / Transactions
+        ↓
+rollback journal OR WAL
+        ↓
+process-local + cross-process locking
+        ↓
+database file
+
+Lifecycle:
+ integrity · REINDEX · VACUUM · EXPLAIN ANALYZE
+ free-list reuse · incremental VACUUM
+
+v1.3 ordered-index path:
+ equality prefix → optional range → rowid lookup → residual filter
 ```
 
-## New capabilities
+## v1.3 additions
 
-- `AND` conjunctions and `BETWEEN`;
-- `< <= > >=` secondary-index range scans;
-- composite indexes `(a,b,...)`;
-- lexicographic self-delimiting key tuples;
-- left-prefix planner rule;
-- `SEEK_INDEX_RANGE` bytecode;
-- range-aware cost model after ANALYZE;
-- composite-index INSERT/UPDATE/DELETE/REINDEX/VACUUM maintenance;
-- integrity checking of composite physical keys;
-- ordered-index example and documentation.
+- `<`, `<=`, `>`, `>=`, `BETWEEN`, and conjunctions with `AND`;
+- `ByteKeyBTree.scan_range(lower, upper)` over half-open ordered intervals;
+- composite `CREATE INDEX idx ON t(a, b, ...)`;
+- lexicographically ordered self-delimiting composite keys with trailing rowid;
+- SQL left-prefix planning: zero or more equality keys plus at most one following range key;
+- `SEEK_INDEX_RANGE` VM execution;
+- NULL-safe ordered bounds;
+- ANALYZE-based broad-range scan vs selective-range index decisions;
+- composite-index maintenance across INSERT / UPDATE / DELETE / REINDEX / VACUUM / integrity checking;
+- main-file format version 3 for composite-index catalog semantics.
 
-## Format compatibility
+## Validation
 
-The main database format version is **3**.
+The frozen `v1.3` branch passed the exact GitHub Actions matrix on Python 3.10 and 3.12, including the full test suite, all historical smoke examples, the ordered-range example, and package compilation.
 
-The page-0 byte layout itself is unchanged from v1.2; format 3 marks a catalog semantic change: index metadata can contain an ordered `columns[]` tuple instead of only one column. Table/index B+Tree page layouts, row encoding, rollback-journal format, WAL format, free-page format, and lock sidecars are unchanged.
+## Recommended v1.3 reading path
 
-v1.3 reads format-v1 and format-v2 databases. Before a composite index becomes reachable, the engine persists page 0 as format v3. Older v1.2 engines therefore reject the database rather than silently treating `(a,b)` as index `(a)`.
-
-## Validation target
-
-- all v0.1–v1.2 regressions;
-- dedicated range/composite-index tests;
-- NULL range boundary tests;
-- UPDATE/DELETE/reopen/integrity tests;
-- REINDEX/VACUUM composite-index tests;
-- broad-vs-selective cost-plan flip;
-- Python 3.10 / 3.12 exact branch-head CI;
-- 13 smoke examples and `compileall`.
+1. `docs/ORDERED_INDEXES.md`
+2. `mini_sqlite/index/key_codec.py`
+3. `mini_sqlite/index/btree.py`
+4. `mini_sqlite/index/secondary.py`
+5. `mini_sqlite/planner/indexing.py`
+6. `mini_sqlite/planner/optimizer.py`
+7. `mini_sqlite/vm/compiler.py`
+8. `tests/test_range_composite.py`
+9. `examples/range_indexes.py`
 
 ## Next
 
-**v1.4 — Savepoints**: partial rollback boundaries inside one transaction, including allocation/free-list and rollback/WAL correctness.
+```text
+v1.4 — Savepoints
+```
+
+Goal: partial rollback boundaries inside one transaction (`SAVEPOINT`, `ROLLBACK TO`, `RELEASE`) while preserving page-allocation/free-list and rollback/WAL correctness.
